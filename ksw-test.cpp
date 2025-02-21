@@ -12,6 +12,7 @@ int main() {
     parameters.SetScalingModSize(scaleModSize);
     parameters.SetBatchSize(4);
     parameters.SetSecurityLevel(securityLevel);
+    parameters.SetKeySwitchTechnique(DECOMP); // new key switching technique
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
     std::cout << "CKKS scheme is using ring dimension "
@@ -52,12 +53,13 @@ int main() {
     std::cout << std::endl;
 
     auto ctx_mult = cc->EvalMultAndRelinearize(ctx1, ctx2);
+    std::cout << "out" << std::endl;
 
     Plaintext ptx_mult;
     cc->Decrypt(keyPair.secretKey, ctx_mult, &ptx_mult);
-    ptx_mult4->SetLength(4);
+    ptx_mult->SetLength(4);
     std::vector<double> msg_mult = ptx_mult->GetRealPackedValue();
-    std::cout << "msg1*msg2: " << msg_mult4 << std::endl;
+    std::cout << "msg1*msg2: " << msg_mult << std::endl;
     std::cout << std::endl;
 
     return 0;

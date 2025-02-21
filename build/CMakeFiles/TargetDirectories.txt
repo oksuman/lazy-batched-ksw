@@ -1,0 +1,3 @@
+/home/ml/dev/Seunghu/ksw-decomp/build/CMakeFiles/ksw-test.dir
+/home/ml/dev/Seunghu/ksw-decomp/build/CMakeFiles/edit_cache.dir
+/home/ml/dev/Seunghu/ksw-decomp/build/CMakeFiles/rebuild_cache.dir

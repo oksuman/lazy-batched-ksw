@@ -65,6 +65,9 @@
         "cinttypes": "cpp",
         "typeindex": "cpp",
         "typeinfo": "cpp",
-        "semaphore": "cpp"
+        "semaphore": "cpp",
+        "bitset": "cpp",
+        "forward_list": "cpp",
+        "valarray": "cpp"
     }
 }
