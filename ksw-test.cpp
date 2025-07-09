@@ -12,7 +12,9 @@ int main() {
     parameters.SetScalingModSize(scaleModSize);
     parameters.SetBatchSize(4);
     parameters.SetSecurityLevel(securityLevel);
-    parameters.SetKeySwitchTechnique(DECOMP); // new key switching technique
+    parameters.SetKeySwitchTechnique(BATCHED); // new key switching technique
+    
+    std::cout << "Using Key Switching Technique: " << parameters.GetKeySwitchTechnique() << std::endl;
     CryptoContext<DCRTPoly> cc = GenCryptoContext(parameters);
 
     std::cout << "CKKS scheme is using ring dimension "
@@ -24,6 +26,7 @@ int main() {
 
     auto keyPair = cc->KeyGen();
     cc->EvalMultKeyGen(keyPair.secretKey);
+    cc->EvalRotateKeyGen()
 
     std::vector<double> msg1 = {1.0, 2.0, 3.0, 4.0};
     std::vector<double> msg2 = {5.0, 6.0, 7.0, 8.0};
@@ -37,6 +40,8 @@ int main() {
 
     auto ctx1 = cc->Encrypt(keyPair.publicKey, ptx1);
     auto ctx2 = cc->Encrypt(keyPair.publicKey, ptx2);
+    std::cout << "Element Size: " << ctx1->GetElements().size() << std::endl;
+
 
     Plaintext decrypted_ptx1, decrypted_ptx2;
     cc->Decrypt(keyPair.secretKey, ctx1, &decrypted_ptx1);
@@ -52,11 +57,13 @@ int main() {
     std::cout << "decrypted msg2: " << decrypted_msg2 << std::endl;
     std::cout << std::endl;
 
-    auto ctx_mult = cc->EvalMultAndRelinearize(ctx1, ctx2);
-    std::cout << "out" << std::endl;
-
+    auto ctx_mult = cc->EvalMult(ctx1, ctx2);
+    std::cout << "Element Size: " << ctx_mult->GetElements().size() << std::endl;
+    auto ctx_relin = cc->Relinearize(ctx_mult);
+    std::cout << "Element Size: " << ctx_relin->GetElements().size() << std::endl;
+ 
     Plaintext ptx_mult;
-    cc->Decrypt(keyPair.secretKey, ctx_mult, &ptx_mult);
+    cc->Decrypt(keyPair.secretKey, ctx_relin, &ptx_mult);
     ptx_mult->SetLength(4);
     std::vector<double> msg_mult = ptx_mult->GetRealPackedValue();
     std::cout << "msg1*msg2: " << msg_mult << std::endl;

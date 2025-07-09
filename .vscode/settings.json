@@ -68,6 +68,10 @@
         "semaphore": "cpp",
         "bitset": "cpp",
         "forward_list": "cpp",
-        "valarray": "cpp"
+        "valarray": "cpp",
+        "strstream": "cpp",
+        "coroutine": "cpp",
+        "source_location": "cpp",
+        "variant": "cpp"
     }
 }
