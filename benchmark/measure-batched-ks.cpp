@@ -317,7 +317,7 @@ static MeasOut MeasureBatched(const CryptoContext<DCRTPoly>& cc,
 
 int main(int argc, char** argv){
     // args: [trials]
-    const int trials = (argc>=2 ? std::max(1, std::atoi(argv[1])) : 100);
+    const int trials = (argc>=2 ? std::max(1, std::atoi(argv[1])) : 10);
 
     const std::vector<int> K = {2,4,8,16,32,64,128};
     auto presets = MakePresets();

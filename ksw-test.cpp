@@ -3,13 +3,14 @@
 using namespace lbcrypto;
 
 void CKKSTest(){
-    uint32_t multDepth = 2;
+    uint32_t multDepth = 3;
     uint32_t scaleModSize = 50;
     SecurityLevel securityLevel = HEStd_128_classic;
 
     CCParams<CryptoContextCKKSRNS> parameters;
     parameters.SetMultiplicativeDepth(multDepth);
     parameters.SetScalingModSize(scaleModSize);
+    parameters.SetRingDim(1<<14);
     parameters.SetBatchSize(4);
     parameters.SetSecurityLevel(securityLevel);
     parameters.SetKeySwitchTechnique(BATCHED); // new key switching technique
@@ -52,12 +53,15 @@ void CKKSTest(){
     auto ctx2 = cc->Encrypt(keyPair.publicKey, ptx2);
     auto ctx3 = cc->Encrypt(keyPair.publicKey, ptx3);
 
+    // tower problem
     ctx1 = cc->EvalLazyRotate(ctx1, 1); 
     ctx2 = cc->EvalLazyRotate(ctx2, 2); 
+    ctx2 = cc->EvalMult(ctx2, ptx4);
+    ctx2 = cc->EvalMult(ctx2, ptx5);
     ctx3 = cc->EvalLazyRotate(ctx3, 3); 
+    ctx3 = cc->EvalMult(ctx3, ptx5);
     auto ctx_add = cc->EvalLazyAdd(ctx1, ctx2);
     ctx_add = cc->EvalLazyAdd(ctx_add, ctx3);
-    ctx_add = cc->EvalMult(ctx_add, ptx4);
     
     ctx1 = cc->EvalBatchedKS(ctx1);
     ctx2 = cc->EvalBatchedKS(ctx2);
