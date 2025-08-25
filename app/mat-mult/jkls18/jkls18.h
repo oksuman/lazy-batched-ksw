@@ -15,10 +15,12 @@ public:
 
     std::vector<double> generateSigmaMsk(int k);
     Ciphertext<DCRTPoly> sigmaTransform(const Ciphertext<DCRTPoly> &M);
+    Ciphertext<DCRTPoly> sigmaTransformHoisting(const Ciphertext<DCRTPoly> &M);
     Ciphertext<DCRTPoly> sigmaTransformLazy(const Ciphertext<DCRTPoly> &M);
 
     std::vector<double> generateTauMsk(int k);
     Ciphertext<DCRTPoly> tauTransform(const Ciphertext<DCRTPoly> &M);
+    Ciphertext<DCRTPoly> tauTransformHoisting(const Ciphertext<DCRTPoly> &M);
     Ciphertext<DCRTPoly> tauTransformLazy(const Ciphertext<DCRTPoly> &M);
 
     std::vector<double> generateShiftingMsk(int k);
@@ -28,6 +30,8 @@ public:
     std::vector<double> vectorRotate(const std::vector<double> &vec, int rotateIndex);
 
     Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& matA,
+                                   const Ciphertext<DCRTPoly>& matB);
+    Ciphertext<DCRTPoly> eval_mult_hoist(const Ciphertext<DCRTPoly>& matA,
                                    const Ciphertext<DCRTPoly>& matB);
 
     Ciphertext<DCRTPoly> eval_mult_lazy(const Ciphertext<DCRTPoly>& matA,

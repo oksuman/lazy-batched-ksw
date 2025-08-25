@@ -18,6 +18,12 @@
 
 using namespace lbcrypto;
 
+// -------- Toggle experiments (uncomment to enable) --------
+// #define RUN_BASELINE 1
+// #define RUN_LAZY 1
+#define RUN_HOIST 1
+// ---------------------------------------------------------
+
 #if defined(__GLIBC__)
   #include <malloc.h>
   static inline void TrimMalloc() { malloc_trim(0); }
@@ -30,9 +36,8 @@ static inline void HardReset() {
     TrimMalloc();
 }
 
-
 // ================= User-tunable =================
-static const int      kTrials = 1;
+static const int      kTrials = 100;
 static const unsigned kSeed   = 1337u;
 // static const int      kDims[] = {8};
 static const int      kDims[] = {8, 16, 32, 64};
@@ -88,20 +93,15 @@ struct ContextPack {
     int num_slots{0}; // = d*d
 };
 
-enum class ExpMode { BASELINE, LAZY_BATCHED };
-
-static ContextPack makeContextForD(int d,
-                                   KeySwitchTechnique ksTech,
-                                   bool useLazy) {
+static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLazy) {
     CCParams<CryptoContextCKKSRNS> P;
     P.SetMultiplicativeDepth(3);
     P.SetRingDim(1<<14);
     P.SetScalingModSize(50);
     P.SetSecurityLevel(HEStd_128_classic);
-    P.SetBatchSize(d * d);          // exactly d*d
+    P.SetBatchSize(d * d); // exactly d*d
 
-    // Key switching choices
-    P.SetKeySwitchTechnique(ksTech); // HYBRID (baseline) or BATCHED (lazy+batched)
+    P.SetKeySwitchTechnique(ksTech); // HYBRID (baseline/hoist) or BATCHED (lazy)
 
     auto cc = GenCryptoContext(P);
     cc->Enable(PKE);
@@ -111,7 +111,7 @@ static ContextPack makeContextForD(int d,
     auto kp = cc->KeyGen();
     cc->EvalMultKeyGen(kp.secretKey);
 
-    // Rotation keys: include 0 as per user preference; cover [-d*d+1, ..., d*d-1].
+    // Rotation keys: include 0; cover [-d*d+1, ..., d*d-1]
     std::vector<int32_t> rotIndices;
     rotIndices.reserve(2 * d * d - 1);
     for (int i = -d*d + 1; i < d*d; ++i) rotIndices.push_back(i);
@@ -126,7 +126,7 @@ static ContextPack makeContextForD(int d,
 static Ciphertext<DCRTPoly>
 encryptMatrix(const CryptoContext<DCRTPoly>& cc,
               const PublicKey<DCRTPoly>& pk,
-              const std::vector<double>& M, int /*d*/) {
+              const std::vector<double>& M) {
     auto pt = cc->MakeCKKSPackedPlaintext(M);
     return cc->Encrypt(pk, pt);
 }
@@ -139,6 +139,7 @@ struct IAlgo {
                                            const Ciphertext<DCRTPoly>& B) = 0;
 };
 
+#ifdef RUN_BASELINE
 struct BaselineAdapter : IAlgo {
     MATMULT_JKLS18 impl;
     BaselineAdapter(const CryptoContext<DCRTPoly>& cc,
@@ -149,7 +150,9 @@ struct BaselineAdapter : IAlgo {
         return impl.eval_mult(A, B);
     }
 };
+#endif
 
+#ifdef RUN_LAZY
 struct LazyAdapter : IAlgo {
     MATMULT_JKLS18 impl;
     LazyAdapter(const CryptoContext<DCRTPoly>& cc,
@@ -157,22 +160,33 @@ struct LazyAdapter : IAlgo {
     std::string getName() const override { return "Lazy"; }
     Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& A,
                                    const Ciphertext<DCRTPoly>& B) override {
-        return impl.eval_mult_lazy(A, B); // should trigger lazy rotates + batched KS inside
+        return impl.eval_mult_lazy(A, B); // lazy rotates + batched KS inside
     }
 };
+#endif
+
+#ifdef RUN_HOIST
+struct HoistAdapter : IAlgo {
+    MATMULT_JKLS18 impl;
+    HoistAdapter(const CryptoContext<DCRTPoly>& cc,
+                 const PublicKey<DCRTPoly>& pk, int d) : impl(cc, pk, d) {}
+    std::string getName() const override { return "Hoist"; }
+    Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& A,
+                                   const Ciphertext<DCRTPoly>& B) override {
+        return impl.eval_mult_hoist(A, B);
+    }
+};
+#endif
 
 // ---------------- Runner ----------------
 template <typename MakeAlgo>
 static std::tuple<Stats, Acc>
 run_one_method(const std::string& label, int d, int trials, unsigned seed,
-               MakeAlgo makeAlgo, ExpMode mode) {
-    const bool useLazy = (mode == ExpMode::LAZY_BATCHED);
-    const KeySwitchTechnique ksTech = useLazy ? BATCHED : HYBRID;
-
+               MakeAlgo makeAlgo,
+               KeySwitchTechnique ksTech, bool useLazy) {
     ContextPack ctx = makeContextForD(d, ksTech, useLazy);
     std::unique_ptr<IAlgo> algo = makeAlgo(ctx.cc, ctx.pk, d);
 
-    // identical inputs
     std::mt19937 gen(seed);
     std::vector<std::vector<double>> A_set, B_set, C_ref_set;
     A_set.reserve(trials); B_set.reserve(trials); C_ref_set.reserve(trials);
@@ -187,8 +201,8 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
 
     // warm-up
     {
-        auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[0], d);
-        auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[0], d);
+        auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[0]);
+        auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[0]);
         auto ctC = algo->eval_mult(ctA, ctB);
         Plaintext pt;
         ctx.cc->Decrypt(ctx.sk, ctC, &pt);
@@ -196,13 +210,12 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
         (void)pt->GetRealPackedValue();
     }
 
-    // trials
     std::vector<double> times_ms; times_ms.reserve(trials);
     double max_abs_err_overall = 0.0; long double mse_sum = 0.0L;
 
     for (int t = 0; t < trials; ++t) {
-        auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[t], d);
-        auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[t], d);
+        auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[t]);
+        auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[t]);
 
         auto t0 = std::chrono::steady_clock::now();
         auto ctC = algo->eval_mult(ctA, ctB);
@@ -237,27 +250,27 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
 // ---------------- Suites ----------------
 struct Row { int d; Stats st; Acc ac; };
 
+#ifdef RUN_BASELINE
 static std::vector<Row> run_baseline_suite(const std::vector<int>& dims, int trials, unsigned seed) {
     std::vector<Row> rows;
     std::cout << "==== Baseline suite ====\n";
     for (int d : dims) {
-
-        {
-            auto [st, ac] = run_one_method(
-                "Baseline   ", d, trials, seed,
-                [](const CryptoContext<DCRTPoly>& cc,
-                   const PublicKey<DCRTPoly>& pk, int d_) {
-                    return std::make_unique<BaselineAdapter>(cc, pk, d_);
-                },
-                ExpMode::BASELINE
-            );
-            rows.push_back({d, st, ac});
-        }
-        HardReset(); 
+        auto [st, ac] = run_one_method(
+            "Baseline   ", d, trials, seed,
+            [](const CryptoContext<DCRTPoly>& cc,
+               const PublicKey<DCRTPoly>& pk, int d_) {
+                return std::make_unique<BaselineAdapter>(cc, pk, d_);
+            },
+            HYBRID, /*useLazy=*/false
+        );
+        rows.push_back({d, st, ac});
+        HardReset();
     }
     return rows;
 }
+#endif
 
+#ifdef RUN_LAZY
 static std::vector<Row> run_lazy_suite(const std::vector<int>& dims, int trials, unsigned seed) {
     std::vector<Row> rows;
     std::cout << "==== Lazy suite ====\n";
@@ -268,52 +281,124 @@ static std::vector<Row> run_lazy_suite(const std::vector<int>& dims, int trials,
                const PublicKey<DCRTPoly>& pk, int d_) {
                 return std::make_unique<LazyAdapter>(cc, pk, d_);
             },
-            ExpMode::LAZY_BATCHED
+            BATCHED, /*useLazy=*/true
         );
         rows.push_back({d, st, ac});
-        lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
-        TrimMalloc();
+        HardReset();
     }
     return rows;
 }
+#endif
+
+#ifdef RUN_HOIST
+static std::vector<Row> run_hoist_suite(const std::vector<int>& dims, int trials, unsigned seed) {
+    std::vector<Row> rows;
+    std::cout << "==== Hoist suite ====\n";
+    for (int d : dims) {
+        auto [st, ac] = run_one_method(
+            "Hoist      ", d, trials, seed,
+            [](const CryptoContext<DCRTPoly>& cc,
+               const PublicKey<DCRTPoly>& pk, int d_) {
+                return std::make_unique<HoistAdapter>(cc, pk, d_);
+            },
+            HYBRID, /*useLazy=*/false // same keys/rotations as baseline
+        );
+        rows.push_back({d, st, ac});
+        HardReset();
+    }
+    return rows;
+}
+#endif
 
 // ---------------- main ----------------
 int main() {
-    lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
-    TrimMalloc();
-
+    HardReset();
     std::vector<int> dims(std::begin(kDims), std::end(kDims));
 
-    
-    auto lazyRows = run_lazy_suite(dims, kTrials, kSeed);
-    lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
-    TrimMalloc();
-    auto baseRows = run_baseline_suite(dims, kTrials, kSeed);
-
+#ifdef RUN_LAZY
+    auto lazyRows  = run_lazy_suite(dims, kTrials, kSeed);
+    HardReset();
+#endif
+#ifdef RUN_BASELINE
+    auto baseRows  = run_baseline_suite(dims, kTrials, kSeed);
+    HardReset();
+#endif
+#ifdef RUN_HOIST
+    auto hoistRows = run_hoist_suite(dims, kTrials, kSeed);
+    HardReset();
+#endif
 
     std::ofstream csv(kCSV);
-    csv << "d,base_mean_ms,base_std_ms,lazy_mean_ms,lazy_std_ms,"
-           "base_max_abs_err,base_mse,lazy_max_abs_err,lazy_mse,speedup_x\n";
     csv << std::fixed << std::setprecision(6);
+
+    // CSV header
+    csv << "d";
+#ifdef RUN_BASELINE
+    csv << ",base_mean_ms,base_std_ms,base_max_abs_err,base_mse";
+#endif
+#ifdef RUN_LAZY
+    csv << ",lazy_mean_ms,lazy_std_ms,lazy_max_abs_err,lazy_mse";
+#endif
+#ifdef RUN_HOIST
+    csv << ",hoist_mean_ms,hoist_std_ms,hoist_max_abs_err,hoist_mse";
+#endif
+#if defined(RUN_BASELINE) && defined(RUN_LAZY)
+    csv << ",speedup_lazy_x";
+#endif
+#if defined(RUN_BASELINE) && defined(RUN_HOIST)
+    csv << ",speedup_hoist_x";
+#endif
+    csv << "\n";
 
     std::cout << "==== Summary ====\n";
     for (size_t i = 0; i < dims.size(); ++i) {
         const int d = dims[i];
+        csv << d;
+
+#ifdef RUN_BASELINE
         const auto& b = baseRows[i];
+        csv << "," << b.st.mean_ms << "," << b.st.std_ms
+            << "," << b.ac.max_abs_err << "," << b.ac.mse;
+#endif
+#ifdef RUN_LAZY
         const auto& l = lazyRows[i];
-        const double speedup = b.st.mean_ms / std::max(1e-12, l.st.mean_ms);
+        csv << "," << l.st.mean_ms << "," << l.st.std_ms
+            << "," << l.ac.max_abs_err << "," << l.ac.mse;
+#endif
+#ifdef RUN_HOIST
+        const auto& h = hoistRows[i];
+        csv << "," << h.st.mean_ms << "," << h.st.std_ms
+            << "," << h.ac.max_abs_err << "," << h.ac.mse;
+#endif
 
-        std::cout << "d=" << d
-                  << " | base " << std::setprecision(3) << b.st.mean_ms << " ms"
-                  << " vs lazy " << l.st.mean_ms << " ms"
-                  << " | speedup " << speedup << "x\n";
+        // Console summary + optional speedups
+        std::cout << "d=" << d;
+#ifdef RUN_BASELINE
+        std::cout << " | base "  << std::setprecision(3) << b.st.mean_ms << " ms";
+#endif
+#ifdef RUN_LAZY
+        std::cout << " | lazy "  << l.st.mean_ms << " ms";
+#endif
+#ifdef RUN_HOIST
+        std::cout << " | hoist " << h.st.mean_ms << " ms";
+#endif
 
-        csv << d << ","
-            << b.st.mean_ms << "," << b.st.std_ms << ","
-            << l.st.mean_ms << "," << l.st.std_ms << ","
-            << b.ac.max_abs_err << "," << b.ac.mse << ","
-            << l.ac.max_abs_err << "," << l.ac.mse << ","
-            << std::setprecision(3) << speedup << std::setprecision(6) << "\n";
+#if defined(RUN_BASELINE) && defined(RUN_LAZY)
+        {
+            double speedup_lazy = b.st.mean_ms / std::max(1e-12, l.st.mean_ms);
+            csv << "," << std::setprecision(3) << speedup_lazy << std::setprecision(6);
+            std::cout << " | speedup(lazy) " << speedup_lazy << "x";
+        }
+#endif
+#if defined(RUN_BASELINE) && defined(RUN_HOIST)
+        {
+            double speedup_hoist = b.st.mean_ms / std::max(1e-12, h.st.mean_ms);
+            csv << "," << std::setprecision(3) << speedup_hoist << std::setprecision(6);
+            std::cout << " | speedup(hoist) " << speedup_hoist << "x";
+        }
+#endif
+        std::cout << "\n";
+        csv << "\n";
     }
     csv.close();
 

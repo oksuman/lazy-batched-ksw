@@ -63,6 +63,49 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::sigmaTransform(const Ciphertext<DCRTPoly> &
 
     return sigma_M;
 }
+
+Ciphertext<DCRTPoly> MATMULT_JKLS18::sigmaTransformHoisting(const Ciphertext<DCRTPoly> &M) {
+    auto n = m_cc->GetRingDimension();
+    auto m = 2*n;
+
+    std::vector<double> zero(d*d, 0.0);
+    auto ptx_zero    = m_cc->MakeCKKSPackedPlaintext(zero);
+    Ciphertext<DCRTPoly> sigma_M = m_cc->Encrypt(m_PublicKey, ptx_zero);
+
+    double squareRootd = sqrt(static_cast<double>(d));
+    int squareRootIntd = static_cast<int>(squareRootd);
+
+    int bs;
+    if (squareRootIntd * squareRootIntd == 0)
+        bs = squareRootIntd;
+    else
+        bs = round(squareRootd);
+
+    auto pre_M = m_cc->EvalFastRotationPrecompute(M);
+    Ciphertext<DCRTPoly> babySteps[bs];
+    for (int i = 0; i < bs; i++) {
+        babySteps[i] = m_cc->EvalFastRotation(M, i, m, pre_M);
+    }
+    for (int i = 1; i < d - bs * (bs - 1); i++) {
+        Plaintext pmsk =
+            m_cc->MakeCKKSPackedPlaintext(generateSigmaMsk(-d + i));
+        m_cc->EvalAddInPlace(sigma_M, m_cc->EvalMult(m_cc->EvalRotate(M, i - d), pmsk));
+    }
+    for (int i = -(bs - 1); i < bs; i++) {
+        Ciphertext<DCRTPoly> tmp = m_cc->Encrypt(m_PublicKey, ptx_zero);
+        for (int j = 0; j < bs; j++) {
+            auto msk = generateSigmaMsk(bs * i + j);
+            msk = vectorRotate(msk, -bs * i);
+            auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk);
+            m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(pmsk, babySteps[j]));
+        }
+        m_cc->EvalAddInPlace(sigma_M, m_cc->EvalRotate(tmp, bs * i));
+    }
+
+    return sigma_M;
+}
+
+
 Ciphertext<DCRTPoly> MATMULT_JKLS18::sigmaTransformLazy(const Ciphertext<DCRTPoly> &M) {
     std::vector<double> zero(d*d, 0.0);
     auto ptx_zero    = m_cc->MakeCKKSPackedPlaintext(zero);
@@ -84,8 +127,7 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::sigmaTransformLazy(const Ciphertext<DCRTPol
     for (int i = 1; i < d - bs * (bs - 1); i++) {
         Plaintext pmsk =
             m_cc->MakeCKKSPackedPlaintext(generateSigmaMsk(-d + i));
-        sigma_M = m_cc->EvalLazyAdd(sigma_M, m_cc->EvalMult(m_cc->EvalLazyRotate(M, i - d), pmsk));
-        // m_cc->EvalLazyAddInPlace(sigma_M, m_cc->EvalMult(m_cc->EvalLazyRotate(M, i - d), pmsk));
+        m_cc->EvalLazyAddInPlace(sigma_M, m_cc->EvalMult(m_cc->EvalLazyRotate(M, i - d), pmsk));
     }
     for (int i = -(bs - 1); i < bs; i++) {
         Ciphertext<DCRTPoly> tmp = m_cc->Encrypt(m_PublicKey, ptx_zero);
@@ -95,8 +137,7 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::sigmaTransformLazy(const Ciphertext<DCRTPol
             auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk);
             m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(pmsk, babySteps[j]));
         }
-        sigma_M = m_cc->EvalLazyAdd(sigma_M, m_cc->EvalLazyRotate(tmp, bs * i));
-        // m_cc->EvalLazyAddInPlace(sigma_M, m_cc->EvalLazyRotate(tmp, bs * i));
+        m_cc->EvalLazyAddInPlace(sigma_M, m_cc->EvalLazyRotate(tmp, bs * i));
     }
     return m_cc->EvalBatchedKS(sigma_M);
 }
@@ -165,6 +206,67 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::tauTransform(const Ciphertext<DCRTPoly> &M)
     return tau_M;
 }
 
+Ciphertext<DCRTPoly> MATMULT_JKLS18::tauTransformHoisting(const Ciphertext<DCRTPoly> &M) {
+    auto n = m_cc->GetRingDimension();
+    auto m = 2*n;
+
+    std::vector<double> zero(d*d, 0.0);
+    auto ptx_zero    = m_cc->MakeCKKSPackedPlaintext(zero);
+    Ciphertext<DCRTPoly> tau_M = m_cc->Encrypt(m_PublicKey, ptx_zero);
+
+    double squareRootd = sqrt(static_cast<double>(d));
+    int squareRootIntd = static_cast<int>(squareRootd);
+
+    auto pre_M = m_cc->EvalFastRotationPrecompute(M);
+    if (squareRootIntd * squareRootIntd == d) {
+        Ciphertext<DCRTPoly> babySteps[squareRootIntd];
+        for (int i = 0; i < squareRootIntd; i++) {
+            babySteps[i] = m_cc->EvalFastRotation(M, d * i, m, pre_M);
+        }
+
+        for (int i = 0; i < squareRootIntd; i++) {
+            auto tmp = m_cc->Encrypt(m_PublicKey, ptx_zero);
+
+            for (int j = 0; j < squareRootIntd; j++) {
+                auto msk = generateTauMsk(squareRootIntd * i + j);
+                msk = vectorRotate(msk, -squareRootIntd * d * i);
+                auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk);
+                m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(babySteps[j], pmsk));
+            }
+            m_cc->EvalAddInPlace(tau_M, m_cc->EvalRotate(tmp, squareRootIntd * d * i));
+        }
+    } else {
+        int steps = round(squareRootd);
+
+        Ciphertext<DCRTPoly> babySteps[steps];
+        for (int i = 0; i < steps; i++) {
+            babySteps[i] = m_cc->EvalFastRotation(M, d * i, m, pre_M);
+        }
+
+        for (int i = 0; i < d - steps * (steps - 1); i++) {
+            Plaintext pmsk = m_cc->MakeCKKSPackedPlaintext(
+                generateTauMsk(steps * (steps - 1) + i));
+            m_cc->EvalAddInPlace(
+                tau_M,
+                m_cc->EvalMult(m_cc->EvalRotate(M, (steps * (steps - 1) + i) * d),
+                                pmsk));
+        }
+        for (int i = 0; i < steps - 1; i++) {
+            auto tmp = m_cc->Encrypt(m_PublicKey, ptx_zero);
+
+            for (int j = 0; j < steps; j++) {
+                auto msk = generateTauMsk(steps * i + j);
+                msk = vectorRotate(msk, -steps * d * i);
+                auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk);
+                m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(babySteps[j], pmsk));
+            }
+            m_cc->EvalAddInPlace(tau_M, m_cc->EvalRotate(tmp, steps * d * i));
+        }
+    }
+
+    return tau_M;
+}
+
 Ciphertext<DCRTPoly> MATMULT_JKLS18::tauTransformLazy(const Ciphertext<DCRTPoly> &M) {
     std::vector<double> zero(d*d, 0.0);
     auto ptx_zero    = m_cc->MakeCKKSPackedPlaintext(zero);
@@ -188,8 +290,7 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::tauTransformLazy(const Ciphertext<DCRTPoly>
                 auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk);
                 m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(babySteps[j], pmsk));
             }
-            tau_M = m_cc->EvalLazyAdd(tau_M, m_cc->EvalLazyRotate(tmp, squareRootIntd * d * i));
-            // m_cc->EvalLazyAddInPlace(tau_M, m_cc->EvalLazyRotate(tmp, squareRootIntd * d * i));
+            m_cc->EvalLazyAddInPlace(tau_M, m_cc->EvalLazyRotate(tmp, squareRootIntd * d * i));
         }
     } else {
         int steps = round(squareRootd);
@@ -202,10 +303,8 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::tauTransformLazy(const Ciphertext<DCRTPoly>
         for (int i = 0; i < d - steps * (steps - 1); i++) {
             Plaintext pmsk = m_cc->MakeCKKSPackedPlaintext(
                 generateTauMsk(steps * (steps - 1) + i));
-            tau_M = m_cc->EvalLazyAdd(
+            m_cc->EvalLazyAddInPlace(
                 tau_M, m_cc->EvalMult(m_cc->EvalLazyRotate(M, (steps * (steps - 1) + i) * d), pmsk));
-            // m_cc->EvalLazyAddInPlace(
-            //     tau_M, m_cc->EvalMult(m_cc->EvalLazyRotate(M, (steps * (steps - 1) + i) * d), pmsk));
         }
         for (int i = 0; i < steps - 1; i++) {
             auto tmp = m_cc->Encrypt(m_PublicKey, ptx_zero);
@@ -216,8 +315,7 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::tauTransformLazy(const Ciphertext<DCRTPoly>
                 auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk);
                 m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(babySteps[j], pmsk));
             }
-            tau_M = m_cc->EvalLazyAdd(tau_M, m_cc->EvalLazyRotate(tmp, steps * d * i));
-            // m_cc->EvalLazyAddInPlace(tau_M, m_cc->EvalLazyRotate(tmp, steps * d * i));
+            m_cc->EvalLazyAddInPlace(tau_M, m_cc->EvalLazyRotate(tmp, steps * d * i));
         }
     }
     return m_cc->EvalBatchedKS(tau_M);
@@ -299,6 +397,26 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::eval_mult(const Ciphertext<DCRTPoly>& matA,
             matrixC, m_cc->EvalMultAndRelinearize(shifted_A, tau_B));
     }
 
+    return matrixC;
+}
+
+// ---------------------- Hoisting ----------------------
+Ciphertext<DCRTPoly> MATMULT_JKLS18::eval_mult_hoist(const Ciphertext<DCRTPoly>& matA,
+                                             const Ciphertext<DCRTPoly>& matB) {
+    auto n = m_cc->GetRingDimension();
+    auto m = 2*n;
+
+    auto sigma_A = sigmaTransformHoisting(matA);
+    auto tau_B = tauTransformHoisting(matB);
+    auto matrixC = m_cc->EvalMultAndRelinearize(sigma_A, tau_B);
+
+    auto pre_B = m_cc->EvalFastRotationPrecompute(tau_B);
+    for (int i = 1; i < d; i++) {
+        auto shifted_A = columnShifting(sigma_A, i);
+        auto tmp = m_cc->EvalFastRotation(tau_B, d*i, m, pre_B);
+        m_cc->EvalAddInPlace(
+            matrixC, m_cc->EvalMultAndRelinearize(shifted_A, tmp));
+    }
     return matrixC;
 }
 

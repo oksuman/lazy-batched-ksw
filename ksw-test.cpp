@@ -27,7 +27,7 @@ void CKKSTest(){
 
     auto keyPair = cc->KeyGen();
     cc->EvalMultKeyGen(keyPair.secretKey);
-    cc->EvalLazyRotateKeyGen(keyPair.secretKey, {1,2,3,6});
+    cc->EvalLazyRotateKeyGen(keyPair.secretKey, {-3, 1,2,3,6});
 
     std::vector<double> msg1 = {1.0, 2.0, 3.0, 4.0};
     std::vector<double> msg2 = {5.0, 6.0, 7.0, 8.0};
@@ -54,7 +54,10 @@ void CKKSTest(){
     auto ctx3 = cc->Encrypt(keyPair.publicKey, ptx3);
 
     // tower problem
-    ctx1 = cc->EvalLazyRotate(ctx1, 1); 
+    ctx1 = cc->EvalLazyRotate(ctx1, -1); 
+    std::cout << ctx1->GetElementKeyIndexVector() << std::endl;
+    ctx1 = cc->EvalLazyRotate(ctx1, -2); 
+    std::cout << ctx1->GetElementKeyIndexVector() << std::endl;
     ctx2 = cc->EvalLazyRotate(ctx2, 2); 
     ctx2 = cc->EvalMult(ctx2, ptx4);
     ctx2 = cc->EvalMult(ctx2, ptx5);
