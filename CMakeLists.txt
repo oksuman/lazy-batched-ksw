@@ -18,6 +18,12 @@ endif ()
 
 set( CMAKE_CXX_FLAGS ${OpenFHE_CXX_FLAGS} )
 
+# Use local OpenFHE headers first
+include_directories( ${CMAKE_SOURCE_DIR}/openfhe-development/src/pke/include )
+include_directories( ${CMAKE_SOURCE_DIR}/openfhe-development/src/core/include )
+include_directories( ${CMAKE_SOURCE_DIR}/openfhe-development/src/binfhe/include )
+include_directories( ${CMAKE_SOURCE_DIR}/openfhe-development/third-party/include )
+
 include_directories( ${OPENMP_INCLUDES} )
 include_directories( ${OpenFHE_INCLUDE} )
 include_directories( ${OpenFHE_INCLUDE}/third-party/include )
