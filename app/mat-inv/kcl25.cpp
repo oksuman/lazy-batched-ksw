@@ -1,4 +1,6 @@
 #include "kcl25.h"
+#include "rotation_collector_base.h"
+#include "rotation_collector_lazy.h"
 
 #include <algorithm>
 #include <cmath>
@@ -33,7 +35,6 @@ void MATINV_KCL25::init_params_or_throw() {
 
     B         = d / s;
     num_slots = s * d * d;
-    std::cout << "num slots:" << num_slots << std::endl;
 
     // np depends on d (same as original)
     switch (d) {
@@ -772,4 +773,185 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy_debug(const Ciphertext<DCRT
     std::cout << "=== eval_inverse_lazy_debug: Complete ===" << std::endl;
 
     return Y;
+}
+
+// ============================================================================
+// Plan functions: collect required rotation indices
+// ============================================================================
+
+// Helper to create zero ciphertext for plan functions
+Ciphertext<DCRTPoly> MATINV_KCL25::createZeroCT() const {
+    // Create zero vector with d*d size (matching crypto context batch size)
+    std::vector<double> zero(d * d, 0.0);
+    auto pt = m_cc->MakeCKKSPackedPlaintext(zero);
+    auto ct = m_cc->Encrypt(m_pk, pt);
+    // Set slots to num_slots for batching (replicates the d*d data s times)
+    ct->SetSlots(num_slots);
+    return ct;
+}
+
+// Baseline plan functions - just collect rotation indices
+void MATINV_KCL25::eval_transpose_plan(RotationKeyCollector& rk) const {
+    for (int i = 1; i < d; i++) {
+        rk.observe((d - 1) * i);
+    }
+    for (int i = -1; i > -d; i--) {
+        rk.observe((d - 1) * i);
+    }
+}
+
+void MATINV_KCL25::eval_trace_plan(RotationKeyCollector& rk, int batchSize) const {
+    int logB = static_cast<int>(std::log2(static_cast<double>(batchSize)));
+    for (int i = 1; i <= logB; i++) {
+        rk.observe(batchSize / (1 << i));
+    }
+}
+
+void MATINV_KCL25::vecRotsOpt_plan(RotationKeyCollector& rk, int is) const {
+    for (int j = 0; j < s / np; j++) {
+        rk.observe(is * d * s + j * d * np);
+    }
+}
+
+void MATINV_KCL25::eval_mult_plan(RotationKeyCollector& rk) const {
+    // Baby steps for A
+    for (int i = 0; i < nb; i++) {
+        rk.observe(i);
+    }
+    // Baby steps for B
+    if (s >= np) {
+        for (int i = 0; i < np; i++) {
+            rk.observe(i * d);
+        }
+    }
+    // vecRotsOpt
+    for (int i = 0; i < B; i++) {
+        vecRotsOpt_plan(rk, i);
+    }
+    // Giant steps
+    for (int k = -ng; k < ng; k++) {
+        if (k != 0) {
+            rk.observe(k * nb);
+        }
+    }
+    // Final aggregation
+    int logS = static_cast<int>(std::log2(static_cast<double>(s)));
+    for (int i = 1; i <= logS; i++) {
+        rk.observe(num_slots / (1 << i));
+    }
+}
+
+void MATINV_KCL25::eval_inverse_plan(RotationKeyCollector& rk) {
+    eval_transpose_plan(rk);
+    eval_mult_plan(rk);  // M * M^T
+    eval_trace_plan(rk, d * d);
+    // Loop: 2r-1 multiplications
+    for (int i = 0; i < 2 * r - 1; i++) {
+        eval_mult_plan(rk);
+    }
+}
+
+// Lazy plan functions - execute on dummy ciphertexts to collect automorphism indices
+void MATINV_KCL25::eval_transpose_lazy_plan(RotationKeyCollectorLazy& rk) const {
+    auto M = createZeroCT();
+    auto p0 = m_cc->MakeCKKSPackedPlaintext(generateTransposeMsk(0));
+    auto M_transposed = m_cc->EvalMult(M, p0);
+
+    for (int i = 1; i < d; i++) {
+        auto pi = m_cc->MakeCKKSPackedPlaintext(generateTransposeMsk(i));
+        m_cc->EvalLazyAddInPlace(M_transposed, m_cc->EvalMult(m_cc->EvalLazyRotate(M, (d - 1) * i), pi));
+    }
+    for (int i = -1; i > -d; i--) {
+        auto pi = m_cc->MakeCKKSPackedPlaintext(generateTransposeMsk(i));
+        m_cc->EvalLazyAddInPlace(M_transposed, m_cc->EvalMult(m_cc->EvalLazyRotate(M, (d - 1) * i), pi));
+    }
+    // Collect accumulated automorphism indices before EvalBatchedKS
+    rk.observeAutoIndices(M_transposed->GetElementKeyIndexVector());
+}
+
+void MATINV_KCL25::eval_trace_lazy_plan(RotationKeyCollectorLazy& rk, int batchSize) const {
+    std::vector<int32_t> directRotations;
+    // eval_trace_lazy uses EvalDirectRotate - these need immediate keys
+    int logB = static_cast<int>(std::log2(static_cast<double>(batchSize)));
+    for (int i = 1; i <= logB; i++) {
+        directRotations.push_back(batchSize / (1 << i));
+    }
+    rk.observeAutoIndices(directRotations);
+}
+
+void MATINV_KCL25::vecRotsOptLazy_plan(RotationKeyCollectorLazy& rk, const std::vector<Ciphertext<DCRTPoly>>& matrixM, int is) const {
+    auto rotsM = zeroClone();
+    for (int j = 0; j < s / np; j++) {
+        auto T = zeroClone();
+        for (int i = 0; i < np; i++) {
+            auto msk = generateMaskVector(num_slots, np * j + i);
+            msk = vectorRotate(msk, -is * d * s - j * d * np);
+            auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk, 1, 0, nullptr, num_slots);
+            m_cc->EvalAddInPlace(T, m_cc->EvalMult(matrixM[i], pmsk));
+        }
+        m_cc->EvalLazyAddInPlace(rotsM, m_cc->EvalLazyRotate(T, is * d * s + j * d * np));
+    }
+    // Collect before EvalBatchedKS
+    rk.observeAutoIndices(rotsM->GetElementKeyIndexVector());
+}
+
+void MATINV_KCL25::eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const {
+    std::vector<int32_t> directRotations;
+
+    auto matrixA = createZeroCT();
+    auto matrixB = createZeroCT();
+    auto matrixC = zeroClone();
+
+    // Baby steps use EvalDirectRotate - collect these indices
+    for (int i = 0; i < nb; i++) {
+        directRotations.push_back(i);
+    }
+    if (s >= np) {
+        for (int i = 0; i < np; i++) {
+            directRotations.push_back(i * d);
+        }
+    }
+
+    // Create dummy baby steps for vecRotsOptLazy
+    std::vector<Ciphertext<DCRTPoly>> babyStepsOfB;
+    if (s >= np) {
+        for (int i = 0; i < np; i++) {
+            babyStepsOfB.push_back(createZeroCT());
+        }
+    }
+
+    // vecRotsOptLazy and giant steps use EvalLazyRotate
+    for (int i = 0; i < B; i++) {
+        if (s >= np) {
+            vecRotsOptLazy_plan(rk, babyStepsOfB, i);
+        }
+
+        auto diagA = zeroClone();
+        for (int k = -ng; k < ng; k++) {
+            auto tmp = zeroClone();
+            // ... (masking operations don't need rotation keys)
+            m_cc->EvalLazyAddInPlace(diagA, m_cc->EvalLazyRotate(tmp, k * nb));
+        }
+        // Collect before EvalBatchedKS in eval_mult_lazy
+        rk.observeAutoIndices(diagA->GetElementKeyIndexVector());
+    }
+
+    // Final aggregation uses EvalDirectRotate
+    int logS = static_cast<int>(std::log2(static_cast<double>(s)));
+    for (int i = 1; i <= logS; i++) {
+        directRotations.push_back(num_slots / (1 << i));
+    }
+
+    // Collect all direct rotations
+    rk.observeAutoIndices(directRotations);
+}
+
+void MATINV_KCL25::eval_inverse_lazy_plan(RotationKeyCollectorLazy& rk) {
+    eval_transpose_lazy_plan(rk);
+    eval_mult_lazy_plan(rk);  // M * M^T
+    eval_trace_lazy_plan(rk, d * d);
+    // Loop: 2r-1 multiplications
+    for (int i = 0; i < 2 * r - 1; i++) {
+        eval_mult_lazy_plan(rk);
+    }
 }

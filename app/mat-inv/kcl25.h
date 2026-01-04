@@ -6,6 +6,10 @@
 
 using namespace lbcrypto;
 
+// Forward declarations for rotation collectors
+class RotationKeyCollector;
+class RotationKeyCollectorLazy;
+
 // Template-free, runtime-dimension implementation
 class MATINV_KCL25 {
 public:
@@ -17,6 +21,10 @@ public:
 
     Ciphertext<DCRTPoly> eval_inverse(const Ciphertext<DCRTPoly>& M);
     Ciphertext<DCRTPoly> eval_inverse_lazy(const Ciphertext<DCRTPoly>& M);
+
+    // Plan functions to collect required rotation indices
+    void eval_inverse_plan(RotationKeyCollector& rk);
+    void eval_inverse_lazy_plan(RotationKeyCollectorLazy& rk);
 
     // Debug versions that decrypt intermediate values
     Ciphertext<DCRTPoly> eval_inverse_debug(const Ciphertext<DCRTPoly>& M,
@@ -80,4 +88,17 @@ private:
     //                                     const Ciphertext<DCRTPoly>& matrixB) const;
 
     std::vector<double> initializeIdentityMatrix(int dim) const;
+
+    // Helper for lazy plan functions
+    Ciphertext<DCRTPoly> createZeroCT() const;
+
+    // Plan helper functions
+    void eval_transpose_plan(RotationKeyCollector& rk) const;
+    void eval_transpose_lazy_plan(RotationKeyCollectorLazy& rk) const;
+    void eval_trace_plan(RotationKeyCollector& rk, int batchSize) const;
+    void eval_trace_lazy_plan(RotationKeyCollectorLazy& rk, int batchSize) const;
+    void eval_mult_plan(RotationKeyCollector& rk) const;
+    void eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const;
+    void vecRotsOpt_plan(RotationKeyCollector& rk, int is) const;
+    void vecRotsOptLazy_plan(RotationKeyCollectorLazy& rk, const std::vector<Ciphertext<DCRTPoly>>& matrixM, int is) const;
 };

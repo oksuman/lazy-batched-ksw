@@ -15,13 +15,15 @@
 
 #include "openfhe.h"
 #include "kcl25.h"
+#include "rotation_collector_base.h"
+#include "rotation_collector_lazy.h"
 
 using namespace lbcrypto;
 
 // -------- Toggle experiments (uncomment to enable) --------
-#define RUN_BASELINE 1
+// #define RUN_BASELINE 1
 #define RUN_LAZY 1
-#define DEBUG_MODE 1  
+// #define DEBUG_MODE 1  
 // ---------------------------------------------------------
 
 #if defined(__GLIBC__)
@@ -37,9 +39,9 @@ static inline void HardReset() {
 }
 
 // ================= User-tunable =================
-static const int      kTrials = 5;
+static const int      kTrials = 1;
 static const unsigned kSeed   = 1337u;
-static const int      kDims[] = {4};
+static const int      kDims[] = {4,8,16};
 static const char*    kCSV    = "kcl25_bench_results.csv";
 // ================================================
 
@@ -165,6 +167,30 @@ static std::vector<double> matrixInversePlain(const std::vector<double>& A, int 
     return inv;
 }
 
+// ---------------- Helper functions ----------------
+// Get iteration count r based on dimension d (from inverse_newCol_test.cpp)
+static int getIterations(int d) {
+    switch (d) {
+        case 4:  return 18;
+        case 8:  return 21;
+        case 16: return 25;
+        case 32: return 28;
+        case 64: return 31;
+        default: return 20;
+    }
+}
+
+static int getMultDepth(int d) {
+    switch (d) {
+        case 4:  return 2 * 18 + 12; // =48, r=18
+        case 8:  return 29;
+        case 16: return 29;
+        case 32: return 29;
+        case 64: return 29;
+        default: return 34;
+    }
+}
+
 // ---------------- Context builder ----------------
 struct ContextPack {
     CryptoContext<DCRTPoly> cc;
@@ -234,13 +260,24 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
         cc->EvalBootstrapKeyGen(kp.secretKey, max_batch);
     }
 
-    // Rotation keys: need full range for batched operations
-    int max_rot = s * d * d;
-    std::vector<int32_t> rotIndices;
-    for (int i = -max_rot + 1; i < max_rot; ++i) rotIndices.push_back(i);
+    // Use rotation collectors to generate only the needed rotation keys
+    // Create a temporary MATINV_KCL25 instance to run the plan function
+    MATINV_KCL25 temp_impl(cc, kp.publicKey, d, getIterations(d), getMultDepth(d));
 
-    if (useLazy) cc->EvalLazyRotateKeyGen(kp.secretKey, rotIndices);
-    else         cc->EvalRotateKeyGen(kp.secretKey,     rotIndices);
+    if (useLazy) {
+        RotationKeyCollectorLazy rk;
+        rk.begin(s * d * d);
+        temp_impl.eval_inverse_lazy_plan(rk);
+        auto collected = rk.getCollectedAutoIndices();
+        std::cout << "  [Lazy] Generating optimized rotation keys\n";
+        rk.generate(cc, kp.secretKey);
+    } else {
+        RotationKeyCollector rk;
+        rk.begin(s * d * d, false);
+        temp_impl.eval_inverse_plan(rk);
+        std::cout << "  [Baseline] Generating optimized rotation keys\n";
+        rk.generate(cc, kp.secretKey);
+    }
 
     return {cc, kp.publicKey, kp.secretKey, s * d * d, s};
 }
@@ -265,29 +302,6 @@ struct IAlgo {
     virtual Ciphertext<DCRTPoly> eval_inverse(const Ciphertext<DCRTPoly>& M) = 0;
     virtual void setSecretKey(const PrivateKey<DCRTPoly>& sk) = 0;
 };
-
-// Get iteration count r based on dimension d (from inverse_newCol_test.cpp)
-static int getIterations(int d) {
-    switch (d) {
-        case 4:  return 14;
-        case 8:  return 21;
-        case 16: return 25;
-        case 32: return 28;
-        case 64: return 31;
-        default: return 20; 
-    }
-}
-
-static int getMultDepth(int d) {
-    switch (d) {
-        case 4:  return 2 * 18 + 12; // r=18
-        case 8:  return 34;
-        case 16: return 34;
-        case 32: return 29;
-        case 64: return 29;
-        default: return 34;
-    }
-}
 
 #ifdef RUN_BASELINE
 struct BaselineAdapter : IAlgo {
@@ -353,14 +367,14 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
     }
 
     // warm-up
-    // {
-    //     auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[0], ctx.num_slots);
-    //     auto ctMinv = algo->eval_inverse(ctM);
-    //     Plaintext pt;
-    //     ctx.cc->Decrypt(ctx.sk, ctMinv, &pt);
-    //     pt->SetLength(d * d);
-    //     (void)pt->GetRealPackedValue();
-    // }
+    {
+        auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[0], ctx.num_slots);
+        auto ctMinv = algo->eval_inverse(ctM);
+        Plaintext pt;
+        ctx.cc->Decrypt(ctx.sk, ctMinv, &pt);
+        pt->SetLength(d * d);
+        (void)pt->GetRealPackedValue();
+    }
 
     std::vector<double> times_ms; times_ms.reserve(trials);
     double max_abs_err_overall = 0.0; long double mse_sum = 0.0L;
@@ -416,61 +430,68 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
 }
 
 // ---------------- Suites ----------------
-struct Row { int d; Stats st; Acc ac; };
+struct Row {
+    int d;
+#ifdef RUN_BASELINE
+    Stats st_base;
+    Acc ac_base;
+#endif
+#ifdef RUN_LAZY
+    Stats st_lazy;
+    Acc ac_lazy;
+#endif
+};
+
+// Run baseline and lazy for a single dimension, with cleanup between
+static Row run_dimension(int d, int trials, unsigned seed) {
+    Row row;
+    row.d = d;
 
 #ifdef RUN_BASELINE
-static std::vector<Row> run_baseline_suite(const std::vector<int>& dims, int trials, unsigned seed) {
-    std::vector<Row> rows;
-    std::cout << "==== Baseline suite ====\n";
-    for (int d : dims) {
-        auto [st, ac] = run_one_method(
-            "Baseline   ", d, trials, seed,
-            [](const CryptoContext<DCRTPoly>& cc,
-               const PublicKey<DCRTPoly>& pk, int d_) {
-                return std::make_unique<BaselineAdapter>(cc, pk, d_);
-            },
-            HYBRID, /*useLazy=*/false
-        );
-        rows.push_back({d, st, ac});
-        HardReset();
-    }
-    return rows;
-}
+    std::cout << "==== d=" << d << " Baseline ====\n";
+    auto [st_base, ac_base] = run_one_method(
+        "Baseline   ", d, trials, seed,
+        [](const CryptoContext<DCRTPoly>& cc,
+           const PublicKey<DCRTPoly>& pk, int d_) {
+            return std::make_unique<BaselineAdapter>(cc, pk, d_);
+        },
+        HYBRID, /*useLazy=*/false
+    );
+    row.st_base = st_base;
+    row.ac_base = ac_base;
+    HardReset();  // Clean up after baseline
 #endif
 
 #ifdef RUN_LAZY
-static std::vector<Row> run_lazy_suite(const std::vector<int>& dims, int trials, unsigned seed) {
-    std::vector<Row> rows;
-    std::cout << "==== Lazy suite ====\n";
-    for (int d : dims) {
-        auto [st, ac] = run_one_method(
-            "Lazy       ", d, trials, seed,
-            [](const CryptoContext<DCRTPoly>& cc,
-               const PublicKey<DCRTPoly>& pk, int d_) {
-                return std::make_unique<LazyAdapter>(cc, pk, d_);
-            },
-            BATCHED, /*useLazy=*/true
-        );
-        rows.push_back({d, st, ac});
-        HardReset();
-    }
-    return rows;
-}
+    std::cout << "==== d=" << d << " Lazy ====\n";
+    auto [st_lazy, ac_lazy] = run_one_method(
+        "Lazy       ", d, trials, seed,
+        [](const CryptoContext<DCRTPoly>& cc,
+           const PublicKey<DCRTPoly>& pk, int d_) {
+            return std::make_unique<LazyAdapter>(cc, pk, d_);
+        },
+        BATCHED, /*useLazy=*/true
+    );
+    row.st_lazy = st_lazy;
+    row.ac_lazy = ac_lazy;
+    HardReset();  // Clean up after lazy
 #endif
+
+    return row;
+}
 
 // ---------------- main ----------------
 int main() {
     HardReset();
     std::vector<int> dims(std::begin(kDims), std::end(kDims));
 
-#ifdef RUN_BASELINE
-    auto baseRows  = run_baseline_suite(dims, kTrials, kSeed);
-    HardReset();
-#endif
-#ifdef RUN_LAZY
-    auto lazyRows  = run_lazy_suite(dims, kTrials, kSeed);
-    HardReset();
-#endif
+    // Run dimension-by-dimension: baseline vs lazy for each d before moving to next
+    std::vector<Row> rows;
+    rows.reserve(dims.size());
+
+    for (int d : dims) {
+        rows.push_back(run_dimension(d, kTrials, kSeed));
+    }
 
     std::ofstream csv(kCSV);
     csv << std::fixed << std::setprecision(6);
@@ -488,35 +509,32 @@ int main() {
 #endif
     csv << "\n";
 
-    std::cout << "==== Summary ====\n";
-    for (size_t i = 0; i < dims.size(); ++i) {
-        const int d = dims[i];
-        csv << d;
+    std::cout << "\n==== Summary ====\n";
+    for (const auto& row : rows) {
+        csv << row.d;
 
 #ifdef RUN_BASELINE
-        const auto& b = baseRows[i];
-        csv << "," << b.st.mean_ms << "," << b.st.std_ms
-            << "," << b.ac.max_abs_err << "," << b.ac.mse
-            << "," << b.ac.identity_max_err << "," << b.ac.identity_mse;
+        csv << "," << row.st_base.mean_ms << "," << row.st_base.std_ms
+            << "," << row.ac_base.max_abs_err << "," << row.ac_base.mse
+            << "," << row.ac_base.identity_max_err << "," << row.ac_base.identity_mse;
 #endif
 #ifdef RUN_LAZY
-        const auto& l = lazyRows[i];
-        csv << "," << l.st.mean_ms << "," << l.st.std_ms
-            << "," << l.ac.max_abs_err << "," << l.ac.mse
-            << "," << l.ac.identity_max_err << "," << l.ac.identity_mse;
+        csv << "," << row.st_lazy.mean_ms << "," << row.st_lazy.std_ms
+            << "," << row.ac_lazy.max_abs_err << "," << row.ac_lazy.mse
+            << "," << row.ac_lazy.identity_max_err << "," << row.ac_lazy.identity_mse;
 #endif
 
-        std::cout << "d=" << d;
+        std::cout << "d=" << row.d;
 #ifdef RUN_BASELINE
-        std::cout << " | base "  << std::setprecision(3) << b.st.mean_ms << " ms";
+        std::cout << " | base "  << std::setprecision(3) << row.st_base.mean_ms << " ms";
 #endif
 #ifdef RUN_LAZY
-        std::cout << " | lazy "  << l.st.mean_ms << " ms";
+        std::cout << " | lazy "  << row.st_lazy.mean_ms << " ms";
 #endif
 
 #if defined(RUN_BASELINE) && defined(RUN_LAZY)
         {
-            double speedup_lazy = b.st.mean_ms / std::max(1e-12, l.st.mean_ms);
+            double speedup_lazy = row.st_base.mean_ms / std::max(1e-12, row.st_lazy.mean_ms);
             csv << "," << std::setprecision(3) << speedup_lazy << std::setprecision(6);
             std::cout << " | speedup(lazy) " << speedup_lazy << "x";
         }
