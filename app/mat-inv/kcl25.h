@@ -24,6 +24,14 @@ public:
     Ciphertext<DCRTPoly> eval_inverse_lazy_debug(const Ciphertext<DCRTPoly>& M,
                                                  const PrivateKey<DCRTPoly>& sk);
 
+    // Exposed for testing
+    Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& matrixA,
+                                   const Ciphertext<DCRTPoly>& matrixB) const;
+    Ciphertext<DCRTPoly> eval_mult_lazy(const Ciphertext<DCRTPoly>& matrixA,
+                                   const Ciphertext<DCRTPoly>& matrixB) const;
+    Ciphertext<DCRTPoly> eval_transpose(Ciphertext<DCRTPoly> M) const;
+    Ciphertext<DCRTPoly> eval_transpose_lazy(Ciphertext<DCRTPoly> M) const;
+
 private:
     CryptoContext<DCRTPoly> m_cc;
     PublicKey<DCRTPoly>     m_pk;
@@ -53,21 +61,23 @@ private:
     std::vector<double> vectorRotate(const std::vector<double>& vec, int rotateIndex) const;
 
     std::vector<double> generateTransposeMsk(int k) const;
-    Ciphertext<DCRTPoly> eval_transpose(Ciphertext<DCRTPoly> M) const;
+    // eval_transpose is now public (exposed for testing)
 
     Ciphertext<DCRTPoly> eval_trace(Ciphertext<DCRTPoly> M, int batchSize) const;
+    Ciphertext<DCRTPoly> eval_trace_lazy(Ciphertext<DCRTPoly> M, int batchSize) const;
 
     std::vector<double> generateMaskVector(int batch_size, int k) const;
     std::vector<double> genDiagVector(int k, int diag_index) const;
-    std::vector<double> genBatchDiagVector(int s_local, int k, int diag_index) const;
+    std::vector<double> genBatchDiagVector(int s, int k, int diag_index) const;
 
     Ciphertext<DCRTPoly> vecRotsOpt(const std::vector<Ciphertext<DCRTPoly>>& matrixM, int is) const;
+    Ciphertext<DCRTPoly> vecRotsOptLazy(const std::vector<Ciphertext<DCRTPoly>>& matrixM, int is) const;
 
-    Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& matrixA,
-                                   const Ciphertext<DCRTPoly>& matrixB) const;
+    // Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& matrixA,
+    //                                const Ciphertext<DCRTPoly>& matrixB) const;
 
-    Ciphertext<DCRTPoly> eval_mult_lazy(const Ciphertext<DCRTPoly>& matrixA,
-                                        const Ciphertext<DCRTPoly>& matrixB) const;
+    // Ciphertext<DCRTPoly> eval_mult_lazy(const Ciphertext<DCRTPoly>& matrixA,
+    //                                     const Ciphertext<DCRTPoly>& matrixB) const;
 
     std::vector<double> initializeIdentityMatrix(int dim) const;
 };

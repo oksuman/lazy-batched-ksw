@@ -10,6 +10,21 @@ endif()
 option(BUILD_STATIC "Set to ON to include static versions of the library" OFF)
 
 find_package(OpenFHE CONFIG REQUIRED)
+
+# macOS with Homebrew OpenMP support
+if(APPLE)
+    execute_process(COMMAND brew --prefix libomp OUTPUT_VARIABLE LIBOMP_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(LIBOMP_PREFIX)
+        set(OpenMP_C_FLAGS "-Xpreprocessor -fopenmp")
+        set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp")
+        set(OpenMP_C_LIB_NAMES "omp")
+        set(OpenMP_CXX_LIB_NAMES "omp")
+        set(OpenMP_omp_LIBRARY "${LIBOMP_PREFIX}/lib/libomp.dylib")
+        include_directories("${LIBOMP_PREFIX}/include")
+        link_directories("${LIBOMP_PREFIX}/lib")
+    endif()
+endif()
+
 find_package(OpenMP QUIET)
 
 if (OpenFHE_FOUND)
@@ -45,6 +60,7 @@ add_executable(kcl25-test
   kcl25-test.cpp
   kcl25.cpp
 )
+
 
 if(OpenMP_CXX_FOUND)
   target_link_libraries(kcl25-test PRIVATE OpenMP::OpenMP_CXX)

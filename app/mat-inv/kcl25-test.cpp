@@ -37,7 +37,7 @@ static inline void HardReset() {
 }
 
 // ================= User-tunable =================
-static const int      kTrials = 1;
+static const int      kTrials = 5;
 static const unsigned kSeed   = 1337u;
 static const int      kDims[] = {4};
 static const char*    kCSV    = "kcl25_bench_results.csv";
@@ -96,27 +96,31 @@ static Acc verifyIdentity(const std::vector<double>& M, const std::vector<double
     return {0.0, 0.0, maxe, (double)(sse / (long double)(d * d))};
 }
 
-// Generate random invertible matrix with elements in [-1, 1]
-static std::vector<double> randomInvertibleMatrix(int d, std::mt19937& gen) {
-    std::uniform_real_distribution<double> off_diag_dis(-0.15, 0.15);
-    std::uniform_real_distribution<double> diag_dis(0.5, 0.9);
-    std::vector<double> M(d * d, 0.0);
-
-    // Generate with diagonal dominance to ensure invertibility
-    for (int i = 0; i < d; ++i) {
-        // First, generate off-diagonal elements
-        double row_sum = 0.0;
-        for (int j = 0; j < d; ++j) {
-            if (i != j) {
-                M[i * d + j] = off_diag_dis(gen); // Small off-diagonal: [-0.15, 0.15]
-                row_sum += std::abs(M[i * d + j]);
-            }
-        }
-        // Diagonal must be larger than sum of absolute values of off-diagonals
-        // to ensure diagonal dominance (sufficient condition for invertibility)
-        double diag_min = row_sum + 0.1;
-        M[i * d + i] = std::max(diag_dis(gen), diag_min); // Ensure diagonal dominance
+// Check invertibility (from matrix-mult-fhe/utils/matrix_utils.h)
+static bool isInvertible(const std::vector<double>& matrix, int d) {
+    double max_elem = 0;
+    double min_elem = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < static_cast<size_t>(d * d); i++) {
+        max_elem = std::max(max_elem, std::abs(matrix[i]));
+        min_elem = std::min(min_elem, std::abs(matrix[i]));
     }
+    if (min_elem < 1e-6 || max_elem / min_elem > 1e6) {
+        return false;
+    }
+    return true;
+}
+
+// Generate random invertible matrix with elements in [-1, 1] (matrix-mult-fhe style)
+static std::vector<double> randomInvertibleMatrix(int d, std::mt19937& gen) {
+    std::uniform_real_distribution<double> dis(-1.0, 1.0);
+    std::vector<double> M(static_cast<size_t>(d * d));
+
+    do {
+        for (int i = 0; i < d * d; i++) {
+            M[static_cast<size_t>(i)] = dis(gen);
+        }
+    } while (!isInvertible(M, d));
+
     return M;
 }
 
@@ -167,6 +171,7 @@ struct ContextPack {
     PublicKey<DCRTPoly>     pk;
     PrivateKey<DCRTPoly>    sk;
     int num_slots{0};
+    int s{0};  // batch count
 };
 
 static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLazy) {
@@ -200,13 +205,13 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
         P.SetFirstModSize(60);
     }
 
-    P.SetRingDim(1<<17);  // 2^17 = 131,072
+ 
     P.SetSecurityLevel(HEStd_128_classic);
 
-    int max_batch = (1<<17) / 2;  // N/2
+    int max_batch = 1 << 16;
     int s = std::min(max_batch / d / d, d);
-    if (s <= 0) s = 1;
-    P.SetBatchSize(s * d * d);  
+    int batchSize = d * d;
+    P.SetBatchSize(batchSize);  
 
     P.SetKeySwitchTechnique(ksTech);
 
@@ -234,20 +239,23 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
     std::vector<int32_t> rotIndices;
     for (int i = -max_rot + 1; i < max_rot; ++i) rotIndices.push_back(i);
 
-    // if (useLazy) cc->EvalLazyRotateKeyGen(kp.secretKey, rotIndices);
-    if (useLazy) cc->EvalRotateKeyGen(kp.secretKey, rotIndices);
+    if (useLazy) cc->EvalLazyRotateKeyGen(kp.secretKey, rotIndices);
     else         cc->EvalRotateKeyGen(kp.secretKey,     rotIndices);
 
-    return {cc, kp.publicKey, kp.secretKey, s * d * d};
+    return {cc, kp.publicKey, kp.secretKey, s * d * d, s};
 }
 
 // ---------------- Encryption helper ----------------
 static Ciphertext<DCRTPoly>
 encryptMatrix(const CryptoContext<DCRTPoly>& cc,
               const PublicKey<DCRTPoly>& pk,
-              const std::vector<double>& M) {
+              const std::vector<double>& M,
+              int num_slots) {
     auto pt = cc->MakeCKKSPackedPlaintext(M);
-    return cc->Encrypt(pk, pt);
+    auto ct = cc->Encrypt(pk, pt);
+    // SetSlots to s*d*d automatically replicates the data s times
+    ct->SetSlots(num_slots);
+    return ct;
 }
 
 // ---------------- Adapters ----------------
@@ -346,7 +354,7 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
 
     // warm-up
     // {
-    //     auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[0]);
+    //     auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[0], ctx.num_slots);
     //     auto ctMinv = algo->eval_inverse(ctM);
     //     Plaintext pt;
     //     ctx.cc->Decrypt(ctx.sk, ctMinv, &pt);
@@ -359,7 +367,7 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
     double identity_max_err_overall = 0.0; long double identity_mse_sum = 0.0L;
 
     for (int t = 0; t < trials; ++t) {
-        auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[t]);
+        auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[t], ctx.num_slots);
 
         auto t0 = std::chrono::steady_clock::now();
         auto ctMinv = algo->eval_inverse(ctM);
@@ -371,6 +379,15 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
         std::vector<double> dec = pt->GetRealPackedValue();
 
         auto acc = accuracy(dec, Minv_ref_set[t]);
+
+        // Debug: print expected vs computed
+        std::cout << "\n=== Comparison ===\n";
+        std::cout << "Expected inverse (first 16): ";
+        for (int i = 0; i < std::min(16, d*d); ++i) std::cout << Minv_ref_set[t][i] << " ";
+        std::cout << "\nComputed inverse (first 16): ";
+        for (int i = 0; i < std::min(16, (int)dec.size()); ++i) std::cout << dec[i] << " ";
+        std::cout << "\nmax_abs_err: " << acc.max_abs_err << ", mse: " << acc.mse << "\n";
+
         if (acc.max_abs_err > max_abs_err_overall) max_abs_err_overall = acc.max_abs_err;
         mse_sum += acc.mse;
 

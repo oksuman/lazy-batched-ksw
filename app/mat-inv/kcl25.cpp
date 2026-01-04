@@ -33,6 +33,7 @@ void MATINV_KCL25::init_params_or_throw() {
 
     B         = d / s;
     num_slots = s * d * d;
+    std::cout << "num slots:" << num_slots << std::endl;
 
     // np depends on d (same as original)
     switch (d) {
@@ -85,9 +86,9 @@ void MATINV_KCL25::init_params_or_throw() {
 }
 
 Ciphertext<DCRTPoly> MATINV_KCL25::createZeroCache() const {
-    // create a zero ciphertext sized to num_slots (safer for later SetSlots usage)
-    std::vector<double> zeroVec(static_cast<size_t>(num_slots), 0.0);
-    auto pt = m_cc->MakeCKKSPackedPlaintext(zeroVec, 1, 0, nullptr, num_slots);
+    // Match newCol: d*d sized zero vector
+    std::vector<double> zeroVec(static_cast<size_t>(d * d), 0.0);
+    auto pt = m_cc->MakeCKKSPackedPlaintext(zeroVec);
     return m_cc->Encrypt(m_pk, pt);
 }
 
@@ -98,15 +99,15 @@ Ciphertext<DCRTPoly> MATINV_KCL25::zeroClone() const {
 }
 
 std::vector<double> MATINV_KCL25::vectorRotate(const std::vector<double>& vec, int rotateIndex) const {
-    if (vec.empty()) return {};
+    if (vec.empty()) return std::vector<double>();
     std::vector<double> result = vec;
     int n = static_cast<int>(result.size());
+
     if (rotateIndex > 0) {
-        rotateIndex %= n;
         std::rotate(result.begin(), result.begin() + rotateIndex, result.end());
     } else if (rotateIndex < 0) {
-        rotateIndex = (-rotateIndex) % n;
-        std::rotate(result.begin(), result.end() - rotateIndex, result.end());
+        rotateIndex += n;
+        std::rotate(result.begin(), result.begin() + rotateIndex, result.end());
     }
     return result;
 }
@@ -138,16 +139,26 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_transpose(Ciphertext<DCRTPoly> M) const 
     return M_transposed;
 }
 
-Ciphertext<DCRTPoly> MATINV_KCL25::eval_trace(Ciphertext<DCRTPoly> M, int batchSize) const {
-    // batchSize should be d*d (for single matrix) or s*d*d (for batched matrices)
-    std::vector<double> msk(static_cast<size_t>(batchSize), 0.0);
+Ciphertext<DCRTPoly> MATINV_KCL25::eval_transpose_lazy(Ciphertext<DCRTPoly> M) const {
+    auto p0 = m_cc->MakeCKKSPackedPlaintext(generateTransposeMsk(0));
+    auto M_transposed = m_cc->EvalMult(M, p0);
 
-    // Set diagonal elements to 1 for each d*d block
-    for (int block = 0; block < batchSize / (d * d); block++) {
-        int offset = block * d * d;
-        for (int i = 0; i < d * d; i += (d + 1)) {
-            msk[static_cast<size_t>(offset + i)] = 1.0;
-        }
+    for (int i = 1; i < d; i++) {
+        auto pi = m_cc->MakeCKKSPackedPlaintext(generateTransposeMsk(i));
+        m_cc->EvalLazyAddInPlace(M_transposed, m_cc->EvalMult(m_cc->EvalLazyRotate(M, (d - 1) * i), pi));
+    }
+    for (int i = -1; i > -d; i--) {
+        auto pi = m_cc->MakeCKKSPackedPlaintext(generateTransposeMsk(i));
+        m_cc->EvalLazyAddInPlace(M_transposed, m_cc->EvalMult(m_cc->EvalLazyRotate(M, (d - 1) * i), pi));
+    }
+    M_transposed = m_cc->EvalBatchedKS(M_transposed);
+    return M_transposed;
+}
+
+Ciphertext<DCRTPoly> MATINV_KCL25::eval_trace(Ciphertext<DCRTPoly> M, int batchSize) const {
+    std::vector<double> msk(static_cast<size_t>(batchSize), 0.0);
+    for (int i = 0; i < d * d; i += (d + 1)) {
+        msk[static_cast<size_t>(i)] = 1.0;
     }
 
     auto trace = m_cc->EvalMult(M, m_cc->MakeCKKSPackedPlaintext(msk));
@@ -160,16 +171,32 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_trace(Ciphertext<DCRTPoly> M, int batchS
     return trace;
 }
 
+Ciphertext<DCRTPoly> MATINV_KCL25::eval_trace_lazy(Ciphertext<DCRTPoly> M, int batchSize) const {
+    std::vector<double> msk(static_cast<size_t>(batchSize), 0.0);
+    for (int i = 0; i < d * d; i += (d + 1)) {
+        msk[static_cast<size_t>(i)] = 1.0;
+    }
+
+    auto trace = m_cc->EvalMult(M, m_cc->MakeCKKSPackedPlaintext(msk));
+
+    // Sum across batchSize using rotations
+    int logB = static_cast<int>(std::log2(static_cast<double>(batchSize)));
+    for (int i = 1; i <= logB; i++) {
+        m_cc->EvalAddInPlace(trace, m_cc->EvalDirectRotate(trace, batchSize / (1 << i)));
+    }
+    return trace;
+}
+
 std::vector<double> MATINV_KCL25::generateMaskVector(int batch_size, int k) const {
-    std::vector<double> result(static_cast<size_t>(batch_size), 0.0);
-    int start = k * d * d;
-    int end   = (k + 1) * d * d;
-    for (int i = start; i < end; ++i) result[static_cast<size_t>(i)] = 1.0;
+    std::vector<double> result(batch_size, 0.0);
+    for (int i = k * d * d; i < (k + 1) * d * d; ++i) {
+        result[i] = 1.0;
+    }
     return result;
 }
 
-std::vector<double> MATINV_KCL25::genDiagVector(int k, int diag_index) const {
-    std::vector<double> result(static_cast<size_t>(d * d), 0.0);
+std::vector<double> MATINV_KCL25::genDiagVector(int k, int diag_index) const  {
+    std::vector<double> result(d * d, 0.0);
 
     if (diag_index < 1 || diag_index > d * d ||
         (diag_index > d && diag_index < d * d - (d - 1))) {
@@ -177,7 +204,7 @@ std::vector<double> MATINV_KCL25::genDiagVector(int k, int diag_index) const {
     }
 
     for (int i = 0; i < d; ++i) {
-        result[static_cast<size_t>(i * d + ((i + k) % d))] = 1.0;
+        result[i * d + ((i + k) % d)] = 1.0;
     }
 
     int rotation = 0;
@@ -194,15 +221,15 @@ std::vector<double> MATINV_KCL25::genDiagVector(int k, int diag_index) const {
         for (int i = 0; i < rotation; ++i) {
             for (int j = 0; j < d; ++j) {
                 if (right_rotation) {
-                    result[static_cast<size_t>(j * d + (d - 1 - i))] = 0.0;
+                    result[j * d + (d - 1 - i)] = 0.0;
                 } else {
-                    result[static_cast<size_t>(j * d + i)] = 0.0;
+                    result[j * d + i] = 0.0;
                 }
             }
         }
     }
 
-    std::vector<double> rotated(static_cast<size_t>(d * d), 0.0);
+    std::vector<double> rotated(d * d, 0.0);
     for (int i = 0; i < d * d; ++i) {
         int new_pos;
         if (right_rotation) {
@@ -210,19 +237,22 @@ std::vector<double> MATINV_KCL25::genDiagVector(int k, int diag_index) const {
         } else {
             new_pos = (i + d - rotation) % d + (i / d) * d;
         }
-        rotated[static_cast<size_t>(new_pos)] = result[static_cast<size_t>(i)];
+        rotated[new_pos] = result[i];
     }
 
     return rotated;
 }
 
-std::vector<double> MATINV_KCL25::genBatchDiagVector(int s_local, int k, int diag_index) const {
+
+std::vector<double> MATINV_KCL25::genBatchDiagVector(int s, int k, int diag_index) const {
     std::vector<double> result;
-    result.reserve(static_cast<size_t>(d * d * s_local));
-    for (int i = 0; i < s_local; ++i) {
-        auto diag = genDiagVector(k + i, diag_index);
-        result.insert(result.end(), diag.begin(), diag.end());
+    result.reserve(d * d * s);
+
+    for (int i = 0; i < s; ++i) {
+        std::vector<double> diag_vector = genDiagVector(k + i, diag_index);
+        result.insert(result.end(), diag_vector.begin(), diag_vector.end());
     }
+
     return result;
 }
 
@@ -244,6 +274,27 @@ MATINV_KCL25::vecRotsOpt(const std::vector<Ciphertext<DCRTPoly>>& matrixM, int i
         m_cc->EvalAddInPlace(rotsM, m_cc->EvalRotate(T, is * d * s + j * d * np));
     }
 
+    return rotsM;
+}
+
+Ciphertext<DCRTPoly>
+MATINV_KCL25::vecRotsOptLazy(const std::vector<Ciphertext<DCRTPoly>>& matrixM, int is) const {
+    auto rotsM = zeroClone();
+
+    // if s < np => loop won't run => returns zero
+    for (int j = 0; j < s / np; j++) {
+        auto T = zeroClone();
+
+        for (int i = 0; i < np; i++) {
+            auto msk = generateMaskVector(num_slots, np * j + i);
+            msk = vectorRotate(msk, -is * d * s - j * d * np);
+
+            auto pmsk = m_cc->MakeCKKSPackedPlaintext(msk, 1, 0, nullptr, num_slots);
+            m_cc->EvalAddInPlace(T, m_cc->EvalMult(matrixM[static_cast<size_t>(i)], pmsk));
+        }
+        m_cc->EvalLazyAddInPlace(rotsM, m_cc->EvalLazyRotate(T, is * d * s + j * d * np));
+    }
+    rotsM = m_cc->EvalBatchedKS(rotsM);
     return rotsM;
 }
 
@@ -323,21 +374,21 @@ MATINV_KCL25::eval_mult_lazy(const Ciphertext<DCRTPoly>& matrixA,
 
     std::vector<Ciphertext<DCRTPoly>> babyStepsOfA(static_cast<size_t>(nb));
     for (int i = 0; i < nb; i++) {
-        babyStepsOfA[static_cast<size_t>(i)] = m_cc->EvalRotate(matrixA, i);
+        babyStepsOfA[static_cast<size_t>(i)] = m_cc->EvalDirectRotate(matrixA, i);
     }
 
     std::vector<Ciphertext<DCRTPoly>> babyStepsOfB;
     if (s >= np) {
         babyStepsOfB.reserve(static_cast<size_t>(np));
         for (int i = 0; i < np; i++) {
-            auto t = m_cc->EvalRotate(matrixB, i * d);
+            auto t = m_cc->EvalDirectRotate(matrixB, i * d);
             t->SetSlots(num_slots);
             babyStepsOfB.push_back(t);
         }
     }
 
     for (int i = 0; i < B; i++) {
-        auto batched_rotations_B = vecRotsOpt(babyStepsOfB, i);
+        auto batched_rotations_B = vecRotsOptLazy(babyStepsOfB, i);
 
         auto diagA = zeroClone();
         for (int k = -ng; k < ng; k++) {
@@ -354,7 +405,7 @@ MATINV_KCL25::eval_mult_lazy(const Ciphertext<DCRTPoly>& matrixA,
                     m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(babyStepsOfA[static_cast<size_t>(babyStep)], pt));
                     babyStep++;
                 }
-                m_cc->EvalAddInPlace(diagA, m_cc->EvalRotate(tmp, k * nb));
+                m_cc->EvalLazyAddInPlace(diagA, m_cc->EvalLazyRotate(tmp, k * nb));
             } else {
                 auto tmp = zeroClone();
                 int babyStep = 0;
@@ -368,17 +419,17 @@ MATINV_KCL25::eval_mult_lazy(const Ciphertext<DCRTPoly>& matrixA,
                     m_cc->EvalAddInPlace(tmp, m_cc->EvalMult(babyStepsOfA[static_cast<size_t>(babyStep)], pt));
                     babyStep++;
                 }
-                m_cc->EvalAddInPlace(diagA, m_cc->EvalRotate(tmp, k * nb));
+                m_cc->EvalLazyAddInPlace(diagA, m_cc->EvalLazyRotate(tmp, k * nb));
             }
         }
-
+        diagA = m_cc->EvalBatchedKS(diagA);
         m_cc->EvalAddInPlace(matrixC, m_cc->EvalMult(diagA, batched_rotations_B));
     }
 
     // Final aggregation: s is power-of-two in these settings
     int logS = static_cast<int>(std::log2(static_cast<double>(s)));
     for (int i = 1; i <= logS; i++) {
-        m_cc->EvalAddInPlace(matrixC, m_cc->EvalRotate(matrixC, num_slots / (1 << i)));
+        m_cc->EvalAddInPlace(matrixC, m_cc->EvalDirectRotate(matrixC, num_slots / (1 << i)));
     }
 
     matrixC->SetSlots(d * d);
@@ -398,7 +449,7 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse(const Ciphertext<DCRTPoly>& M) {
     auto M_transposed  = eval_transpose(M);
     auto MM_transposed = eval_mult(M, M_transposed);
 
-    auto trace = eval_trace(MM_transposed, num_slots);
+    auto trace = eval_trace(MM_transposed, d * d);
     auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 50);
 
     auto Y     = m_cc->EvalMultAndRelinearize(M_transposed, trace_reciprocal);
@@ -421,10 +472,10 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy(const Ciphertext<DCRTPoly>&
     auto vI = initializeIdentityMatrix(d);
     Plaintext pI = m_cc->MakeCKKSPackedPlaintext(vI);
 
-    auto M_transposed  = eval_transpose(M);
+    auto M_transposed  = eval_transpose_lazy(M);
     auto MM_transposed = eval_mult_lazy(M, M_transposed);
 
-    auto trace = eval_trace(MM_transposed, num_slots);
+    auto trace = eval_trace_lazy(MM_transposed, d * d);
     auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 50);
 
     auto Y     = m_cc->EvalMultAndRelinearize(M_transposed, trace_reciprocal);
@@ -486,7 +537,7 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_debug(const Ciphertext<DCRTPoly>
     std::cout << "\nMM_transposed level: " << MM_transposed->GetLevel() << std::endl;
 
     // Trace
-    auto trace = eval_trace(MM_transposed, num_slots);
+    auto trace = eval_trace(MM_transposed, d * d);
     Plaintext ptx_trace;
     m_cc->Decrypt(sk, trace, &ptx_trace);
     ptx_trace->SetLength(d * d);
@@ -602,7 +653,7 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy_debug(const Ciphertext<DCRT
     std::cout << "\nM level: " << M->GetLevel() << std::endl;
 
     // Transpose
-    auto M_transposed = eval_transpose(M);
+    auto M_transposed = eval_transpose_lazy(M);
     Plaintext ptx_Mt;
     m_cc->Decrypt(sk, M_transposed, &ptx_Mt);
     ptx_Mt->SetLength(d * d);
@@ -626,7 +677,7 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy_debug(const Ciphertext<DCRT
     std::cout << "\nMM_transposed level: " << MM_transposed->GetLevel() << std::endl;
 
     // Trace
-    auto trace = eval_trace(MM_transposed, num_slots);
+    auto trace = eval_trace_lazy(MM_transposed, d * d);
     Plaintext ptx_trace;
     m_cc->Decrypt(sk, trace, &ptx_trace);
     ptx_trace->SetLength(d * d);
