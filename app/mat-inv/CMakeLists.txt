@@ -61,7 +61,12 @@ add_executable(kcl25-test
   kcl25.cpp
 )
 
+add_executable(mult-bench
+  mult-bench.cpp
+  kcl25.cpp
+)
 
 if(OpenMP_CXX_FOUND)
   target_link_libraries(kcl25-test PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(mult-bench PRIVATE OpenMP::OpenMP_CXX)
 endif()

@@ -451,15 +451,15 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse(const Ciphertext<DCRTPoly>& M) {
     auto MM_transposed = eval_mult(M, M_transposed);
 
     auto trace = eval_trace(MM_transposed, d * d);
-    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 50);
+    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 5);
 
     auto Y     = m_cc->EvalMultAndRelinearize(M_transposed, trace_reciprocal);
     auto A_bar = m_cc->EvalSub(pI, m_cc->EvalMultAndRelinearize(MM_transposed, trace_reciprocal));
 
     for (int i = 0; i < r - 1; i++) {
         if (d >= 8 && static_cast<int>(Y->GetLevel()) >= depth - 2) {
-            A_bar = m_cc->EvalBootstrap(A_bar, 2, 17);
-            Y     = m_cc->EvalBootstrap(Y, 2, 17);
+            A_bar = m_cc->EvalBootstrap(A_bar);
+            Y     = m_cc->EvalBootstrap(Y);
         }
         Y     = eval_mult(Y, m_cc->EvalAdd(pI, A_bar));
         A_bar = eval_mult(A_bar, A_bar);
@@ -477,15 +477,15 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy(const Ciphertext<DCRTPoly>&
     auto MM_transposed = eval_mult_lazy(M, M_transposed);
 
     auto trace = eval_trace_lazy(MM_transposed, d * d);
-    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 50);
+    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 5);
 
     auto Y     = m_cc->EvalMultAndRelinearize(M_transposed, trace_reciprocal);
     auto A_bar = m_cc->EvalSub(pI, m_cc->EvalMultAndRelinearize(MM_transposed, trace_reciprocal));
 
     for (int i = 0; i < r - 1; i++) {
         if (d >= 8 && static_cast<int>(Y->GetLevel()) >= depth - 2) {
-            A_bar = m_cc->EvalBootstrap(A_bar, 2, 17);
-            Y     = m_cc->EvalBootstrap(Y, 2, 17);
+            A_bar = m_cc->EvalBootstrap(A_bar);
+            Y     = m_cc->EvalBootstrap(Y);
         }
         Y     = eval_mult_lazy(Y, m_cc->EvalAdd(pI, A_bar));
         A_bar = eval_mult_lazy(A_bar, A_bar);
@@ -547,7 +547,7 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_debug(const Ciphertext<DCRTPoly>
     std::cout << "\ntrace level: " << trace->GetLevel() << std::endl;
 
     // Trace reciprocal
-    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 50);
+    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 5);
     Plaintext ptx_tr_recip;
     m_cc->Decrypt(sk, trace_reciprocal, &ptx_tr_recip);
     ptx_tr_recip->SetLength(d * d);
@@ -585,8 +585,8 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_debug(const Ciphertext<DCRTPoly>
         if (d >= 8 && static_cast<int>(Y->GetLevel()) >= depth - 2) {
             std::cout << "Bootstrapping (Y level=" << Y->GetLevel()
                       << ", A_bar level=" << A_bar->GetLevel() << ")" << std::endl;
-            A_bar = m_cc->EvalBootstrap(A_bar, 2, 17);
-            Y = m_cc->EvalBootstrap(Y, 2, 17);
+            A_bar = m_cc->EvalBootstrap(A_bar);
+            Y = m_cc->EvalBootstrap(Y);
             std::cout << "After bootstrap: Y level=" << Y->GetLevel()
                       << ", A_bar level=" << A_bar->GetLevel() << std::endl;
         }
@@ -687,7 +687,7 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy_debug(const Ciphertext<DCRT
     std::cout << "\ntrace level: " << trace->GetLevel() << std::endl;
 
     // Trace reciprocal
-    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 50);
+    auto trace_reciprocal = m_cc->EvalDivide(trace, (d * d) / 3 - d, (d * d) / 3 + d, 5);
     Plaintext ptx_tr_recip;
     m_cc->Decrypt(sk, trace_reciprocal, &ptx_tr_recip);
     ptx_tr_recip->SetLength(d * d);
@@ -725,8 +725,8 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy_debug(const Ciphertext<DCRT
         if (d >= 8 && static_cast<int>(Y->GetLevel()) >= depth - 2) {
             std::cout << "Bootstrapping (Y level=" << Y->GetLevel()
                       << ", A_bar level=" << A_bar->GetLevel() << ")" << std::endl;
-            A_bar = m_cc->EvalBootstrap(A_bar, 2, 17);
-            Y = m_cc->EvalBootstrap(Y, 2, 17);
+            A_bar = m_cc->EvalBootstrap(A_bar);
+            Y = m_cc->EvalBootstrap(Y);
             std::cout << "After bootstrap: Y level=" << Y->GetLevel()
                       << ", A_bar level=" << A_bar->GetLevel() << std::endl;
         }
@@ -876,7 +876,8 @@ void MATINV_KCL25::eval_trace_lazy_plan(RotationKeyCollectorLazy& rk, int batchS
     for (int i = 1; i <= logB; i++) {
         directRotations.push_back(batchSize / (1 << i));
     }
-    rk.observeAutoIndices(directRotations);
+    // Use observeRotationIndices to properly convert rotation indices to automorphism indices
+    rk.observeRotationIndices(m_cc, directRotations);
 }
 
 void MATINV_KCL25::vecRotsOptLazy_plan(RotationKeyCollectorLazy& rk, const std::vector<Ciphertext<DCRTPoly>>& matrixM, int is) const {
@@ -942,8 +943,8 @@ void MATINV_KCL25::eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const {
         directRotations.push_back(num_slots / (1 << i));
     }
 
-    // Collect all direct rotations
-    rk.observeAutoIndices(directRotations);
+    // Use observeRotationIndices to properly convert rotation indices to automorphism indices
+    rk.observeRotationIndices(m_cc, directRotations);
 }
 
 void MATINV_KCL25::eval_inverse_lazy_plan(RotationKeyCollectorLazy& rk) {

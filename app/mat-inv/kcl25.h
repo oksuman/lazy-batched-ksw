@@ -39,6 +39,8 @@ public:
                                    const Ciphertext<DCRTPoly>& matrixB) const;
     Ciphertext<DCRTPoly> eval_transpose(Ciphertext<DCRTPoly> M) const;
     Ciphertext<DCRTPoly> eval_transpose_lazy(Ciphertext<DCRTPoly> M) const;
+    Ciphertext<DCRTPoly> eval_trace(Ciphertext<DCRTPoly> M, int batchSize) const;
+    Ciphertext<DCRTPoly> eval_trace_lazy(Ciphertext<DCRTPoly> M, int batchSize) const;
 
 private:
     CryptoContext<DCRTPoly> m_cc;
@@ -69,10 +71,6 @@ private:
     std::vector<double> vectorRotate(const std::vector<double>& vec, int rotateIndex) const;
 
     std::vector<double> generateTransposeMsk(int k) const;
-    // eval_transpose is now public (exposed for testing)
-
-    Ciphertext<DCRTPoly> eval_trace(Ciphertext<DCRTPoly> M, int batchSize) const;
-    Ciphertext<DCRTPoly> eval_trace_lazy(Ciphertext<DCRTPoly> M, int batchSize) const;
 
     std::vector<double> generateMaskVector(int batch_size, int k) const;
     std::vector<double> genDiagVector(int k, int diag_index) const;

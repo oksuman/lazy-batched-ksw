@@ -21,9 +21,9 @@
 using namespace lbcrypto;
 
 // -------- Toggle experiments (uncomment to enable) --------
-// #define RUN_BASELINE 1
+#define RUN_BASELINE 1
 #define RUN_LAZY 1
-// #define DEBUG_MODE 1  
+#define DEBUG_MODE 1  
 // ---------------------------------------------------------
 
 #if defined(__GLIBC__)
@@ -41,7 +41,7 @@ static inline void HardReset() {
 // ================= User-tunable =================
 static const int      kTrials = 1;
 static const unsigned kSeed   = 1337u;
-static const int      kDims[] = {4,8,16};
+static const int      kDims[] = {4, 8,16};
 static const char*    kCSV    = "kcl25_bench_results.csv";
 // ================================================
 
@@ -53,7 +53,7 @@ static Stats meanStd(const std::vector<double>& v) {
     double var = 0.0; for (double x : v) var += (x - m)*(x - m);
     var /= (double)v.size();
     return {m, std::sqrt(var)};
-}
+} 
 
 struct Acc { double max_abs_err{0.0}; double mse{0.0}; double identity_max_err{0.0}; double identity_mse{0.0}; };
 static Acc accuracy(const std::vector<double>& a, const std::vector<double>& b) {
@@ -171,9 +171,9 @@ static std::vector<double> matrixInversePlain(const std::vector<double>& A, int 
 // Get iteration count r based on dimension d (from inverse_newCol_test.cpp)
 static int getIterations(int d) {
     switch (d) {
-        case 4:  return 18;
-        case 8:  return 21;
-        case 16: return 25;
+        case 4:  return 11;
+        case 8:  return 11;
+        case 16: return 11;
         case 32: return 28;
         case 64: return 31;
         default: return 20;
@@ -182,9 +182,9 @@ static int getIterations(int d) {
 
 static int getMultDepth(int d) {
     switch (d) {
-        case 4:  return 2 * 18 + 12; // =48, r=18
-        case 8:  return 29;
-        case 16: return 29;
+        case 4:  return 31;
+        case 8:  return 31;
+        case 16: return 31;
         case 32: return 29;
         case 64: return 29;
         default: return 34;
@@ -206,19 +206,19 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
     // Dimension-specific setup
     if (d == 4) {
         // d=4: r=18, depth=48, no bootstrapping
-        P.SetMultiplicativeDepth(48);
-        P.SetScalingModSize(50);
-        // FirstModSize not set (use default)
+        P.SetMultiplicativeDepth(31);
+        P.SetScalingModSize(34);
+        // P.SetFirstModSize(60);
     } else if (d == 8) {
         // d=8: r=21, depth=34, bootstrapping enabled
-        P.SetMultiplicativeDepth(34);
-        P.SetScalingModSize(59);
-        P.SetFirstModSize(60);
+        P.SetMultiplicativeDepth(31);
+        P.SetScalingModSize(34);
+        // P.SetFirstModSize(60);
     } else if (d == 16) {
         // d=16: r=25, depth=34, bootstrapping enabled
-        P.SetMultiplicativeDepth(34);
-        P.SetScalingModSize(59);
-        P.SetFirstModSize(60);
+        P.SetMultiplicativeDepth(31);
+        P.SetScalingModSize(34);
+        // P.SetFirstModSize(60);
     } else if (d == 32) {
         // d=32: r=28, depth=29, bootstrapping enabled
         P.SetMultiplicativeDepth(29);
@@ -234,7 +234,7 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
  
     P.SetSecurityLevel(HEStd_128_classic);
 
-    int max_batch = 1 << 16;
+    int max_batch = 1 << 15;
     int s = std::min(max_batch / d / d, d);
     int batchSize = d * d;
     P.SetBatchSize(batchSize);  
@@ -249,15 +249,15 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
     cc->Enable(LEVELEDSHE);
 
     // Bootstrapping for d >= 8
-    if (d >= 8) {
-        cc->EvalBootstrapSetup({4, 5}); // level budget
+    if (d >= 32) {
+        cc->EvalBootstrapSetup({2, 2}, {0,0}, batchSize);
     }
 
     auto kp = cc->KeyGen();
     cc->EvalMultKeyGen(kp.secretKey);
 
-    if (d >= 8) {
-        cc->EvalBootstrapKeyGen(kp.secretKey, max_batch);
+    if (d >= 32) {
+        cc->EvalBootstrapKeyGen(kp.secretKey, batchSize);
     }
 
     // Use rotation collectors to generate only the needed rotation keys
@@ -278,7 +278,9 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
         std::cout << "  [Baseline] Generating optimized rotation keys\n";
         rk.generate(cc, kp.secretKey);
     }
-
+    std::cout << "CKKS scheme is using ring dimension "
+              << cc->GetRingDimension() << std::endl
+              << std::endl;
     return {cc, kp.publicKey, kp.secretKey, s * d * d, s};
 }
 
@@ -367,14 +369,14 @@ run_one_method(const std::string& label, int d, int trials, unsigned seed,
     }
 
     // warm-up
-    {
-        auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[0], ctx.num_slots);
-        auto ctMinv = algo->eval_inverse(ctM);
-        Plaintext pt;
-        ctx.cc->Decrypt(ctx.sk, ctMinv, &pt);
-        pt->SetLength(d * d);
-        (void)pt->GetRealPackedValue();
-    }
+    // {
+    //     auto ctM = encryptMatrix(ctx.cc, ctx.pk, M_set[0], ctx.num_slots);
+    //     auto ctMinv = algo->eval_inverse(ctM);
+    //     Plaintext pt;
+    //     ctx.cc->Decrypt(ctx.sk, ctMinv, &pt);
+    //     pt->SetLength(d * d);
+    //     (void)pt->GetRealPackedValue();
+    // }
 
     std::vector<double> times_ms; times_ms.reserve(trials);
     double max_abs_err_overall = 0.0; long double mse_sum = 0.0L;

@@ -18,6 +18,28 @@ public:
         for (int32_t a : v) autoIdx_.insert(a);
     }
 
+    // For EvalDirectRotate: accepts rotation indices and converts to automorphism indices
+    template <class CryptoContextT>
+    void observeRotationIndices(const CryptoContextT& cc, const std::vector<int32_t>& rotIndices) {
+        std::lock_guard<std::mutex> g(mu_);
+        const int ringDim = static_cast<int>(cc->GetRingDimension());
+        const int M = 2 * ringDim;
+        const int halfSlots = ringDim / 2;
+
+        for (int32_t rot : rotIndices) {
+            // Normalize rotation index to [0, halfSlots)
+            int k = rot % halfSlots;
+            if (k < 0) k += halfSlots;
+
+            // Compute 5^k mod M
+            int64_t autoIdx = 1;
+            for (int i = 0; i < k; ++i) {
+                autoIdx = (autoIdx * 5) % M;
+            }
+            autoIdx_.insert(static_cast<int32_t>(autoIdx));
+        }
+    }
+
     template <class CryptoContextT, class PrivateKeyT>
     void generate(const CryptoContextT& cc, const PrivateKeyT& sk) {
         std::vector<int32_t> exps;

@@ -96,8 +96,6 @@ void CKKSTest(){
     std::cout << std::endl;
 }
 
-
-
 void BFVTest(){
     CCParams<CryptoContextBFVRNS> parameters;
     parameters.SetPlaintextModulus(65537);
