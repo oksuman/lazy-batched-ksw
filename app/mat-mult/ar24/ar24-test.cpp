@@ -27,7 +27,7 @@ using namespace lbcrypto;
   static inline void TrimMalloc() {}
 #endif
 
-static const int   kTrials = 100;
+static const int   kTrials = 1;
 static const unsigned kSeed = 1337u;
 static const int   kDims[] = {8, 16, 32, 64};
 static const char* kCSV   = "ar24_bench_results.csv";

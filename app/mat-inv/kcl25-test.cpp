@@ -23,7 +23,7 @@ using namespace lbcrypto;
 // -------- Toggle experiments (uncomment to enable) --------
 #define RUN_BASELINE 1
 #define RUN_LAZY 1
-#define DEBUG_MODE 1  
+// #define DEBUG_MODE 1  
 // ---------------------------------------------------------
 
 #if defined(__GLIBC__)
@@ -41,7 +41,7 @@ static inline void HardReset() {
 // ================= User-tunable =================
 static const int      kTrials = 1;
 static const unsigned kSeed   = 1337u;
-static const int      kDims[] = {4, 8,16};
+static const int      kDims[] = {4,8,16,32};
 static const char*    kCSV    = "kcl25_bench_results.csv";
 // ================================================
 
@@ -171,20 +171,20 @@ static std::vector<double> matrixInversePlain(const std::vector<double>& A, int 
 // Get iteration count r based on dimension d (from inverse_newCol_test.cpp)
 static int getIterations(int d) {
     switch (d) {
-        case 4:  return 11;
-        case 8:  return 11;
-        case 16: return 11;
+        case 4:  return 16;
+        case 8:  return 20;
+        case 16: return 24;
         case 32: return 28;
-        case 64: return 31;
+        case 64: return 32;
         default: return 20;
     }
 }
 
 static int getMultDepth(int d) {
     switch (d) {
-        case 4:  return 31;
-        case 8:  return 31;
-        case 16: return 31;
+        case 4:  return 41; // 16*2+9
+        case 8:  return 29;
+        case 16: return 29;
         case 32: return 29;
         case 64: return 29;
         default: return 34;
@@ -206,19 +206,19 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
     // Dimension-specific setup
     if (d == 4) {
         // d=4: r=18, depth=48, no bootstrapping
-        P.SetMultiplicativeDepth(31);
-        P.SetScalingModSize(34);
+        P.SetMultiplicativeDepth(41);
+        P.SetScalingModSize(50);
         // P.SetFirstModSize(60);
     } else if (d == 8) {
         // d=8: r=21, depth=34, bootstrapping enabled
-        P.SetMultiplicativeDepth(31);
-        P.SetScalingModSize(34);
-        // P.SetFirstModSize(60);
+        P.SetMultiplicativeDepth(29);
+        P.SetScalingModSize(59);
+        P.SetFirstModSize(60);
     } else if (d == 16) {
         // d=16: r=25, depth=34, bootstrapping enabled
-        P.SetMultiplicativeDepth(31);
-        P.SetScalingModSize(34);
-        // P.SetFirstModSize(60);
+        P.SetMultiplicativeDepth(29);
+        P.SetScalingModSize(59);
+        P.SetFirstModSize(60);
     } else if (d == 32) {
         // d=32: r=28, depth=29, bootstrapping enabled
         P.SetMultiplicativeDepth(29);
@@ -234,11 +234,11 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
  
     P.SetSecurityLevel(HEStd_128_classic);
 
-    int max_batch = 1 << 15;
-    int s = std::min(max_batch / d / d, d);
+    // int max_batch = 1 << 15;
+    // int s = std::min(max_batch / d / d, d);
+    int s = d;
     int batchSize = d * d;
     P.SetBatchSize(batchSize);  
-
     P.SetKeySwitchTechnique(ksTech);
 
     auto cc = GenCryptoContext(P);
@@ -249,14 +249,14 @@ static ContextPack makeContextForD(int d, KeySwitchTechnique ksTech, bool useLaz
     cc->Enable(LEVELEDSHE);
 
     // Bootstrapping for d >= 8
-    if (d >= 32) {
-        cc->EvalBootstrapSetup({2, 2}, {0,0}, batchSize);
+    if (d >= 8) {
+        cc->EvalBootstrapSetup({3, 3}, {0, 0}, batchSize);
     }
 
     auto kp = cc->KeyGen();
     cc->EvalMultKeyGen(kp.secretKey);
 
-    if (d >= 32) {
+    if (d >= 8) {
         cc->EvalBootstrapKeyGen(kp.secretKey, batchSize);
     }
 

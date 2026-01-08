@@ -35,8 +35,8 @@ static inline void HardReset() {
 }
 
 // ================= Configuration =================
-static const int kDims[] = {8};
-static const int kThreads[] = {8};
+static const int kDims[] = {8, 16};
+static const int kThreads[] = {32};
 static const int kMultDepths[] = {24, 32, 36, 40};
 static const int kScalingFactors[] = {30, 34, 40, 45};
 static const int kTrials = 1;

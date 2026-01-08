@@ -157,6 +157,7 @@ static QInfo GetQInfo(const CryptoContext<DCRTPoly>& cc) {
 // -------- Parameter presets --------
 struct Preset {
     std::string name;       // e.g., "N=2^14"
+    uint32_t ringDim;       // Ring dimension
     uint32_t multDepth;     // L
     uint32_t scalingBits;   // ScalingModSize
     uint32_t firstModBits;  // FirstModSize (0 = unused)
@@ -165,10 +166,10 @@ struct Preset {
 };
 static std::vector<Preset> MakePresets(){
     return {
-        {"N=2^14",  9, 34, 46, HEStd_128_classic, 128},
-        {"N=2^15", 17, 40, 51, HEStd_128_classic, 128},
-        {"N=2^16", 26, 45, 56, HEStd_128_classic, 128},
-        // {"N=2^17", 40, 50, 61, HEStd_128_classic, 128}
+        {"N=2^14", 1<<14, 7, 34, 46, HEStd_128_classic, 128},
+        {"N=2^15", 1<<15, 13, 40, 51, HEStd_128_classic, 128},
+        {"N=2^16", 1<<16, 24, 45, 56, HEStd_128_classic, 128},
+        // {"N=2^17", 1<<17, 38, 50, 61, HEStd_128_classic, 128}
     };
 }
 
@@ -176,6 +177,7 @@ static std::vector<Preset> MakePresets(){
 static CryptoContext<DCRTPoly> BuildContext(const Preset& ps, KeySwitchTechnique ksTech){
     CCParams<CryptoContextCKKSRNS> p;
     p.SetSecurityLevel(ps.sec);
+    p.SetRingDim(ps.ringDim);
     p.SetMultiplicativeDepth(ps.multDepth);
     p.SetScalingModSize(ps.scalingBits);
     if (ps.firstModBits) p.SetFirstModSize(ps.firstModBits);
@@ -319,7 +321,7 @@ int main(int argc, char** argv){
     // args: [trials]
     const int trials = (argc>=2 ? std::max(1, std::atoi(argv[1])) : 10);
 
-    const std::vector<int> K = {2,4,8,16,32,64,128};
+    const std::vector<int> K = {2,4,8,16,32,64};
     auto presets = MakePresets();
 
     std::ofstream csv("timings.csv");
@@ -334,7 +336,8 @@ int main(int argc, char** argv){
         "ct_MB_baseline,ct_MB_batched_preKS,rotkeys_MB_base,rotkeys_MB_batched\n";
 
     for (const auto& ps : presets){
-        std::cout << "=== " << ps.name << " | L="<<ps.multDepth
+        std::cout << "=== " << ps.name << " | RingDim(set)="<<ps.ringDim
+                  << " | L="<<ps.multDepth
                   << " | scale="<<ps.scalingBits
                   << " | first="<<ps.firstModBits
                   << " | dnum=3 | KS(Base=HYBRID, Batch=BATCHED) ===\n";
@@ -345,22 +348,36 @@ int main(int argc, char** argv){
             }
             auto ccBatch = BuildContext(ps, BATCHED);
             auto kpBatch = ccBatch->KeyGen();
-            GenRotateKeys_Lazy(ccBatch, kpBatch.secretKey, k);   
+            GenRotateKeys_Lazy(ccBatch, kpBatch.secretKey, k);
             size_t rotBytesBatch = 0; // TODO
 
             auto ccBase  = BuildContext(ps, HYBRID);
             auto kpBase  = ccBase->KeyGen();
-            GenRotateKeys_Baseline(ccBase, kpBase.secretKey, k);       
+            GenRotateKeys_Baseline(ccBase, kpBase.secretKey, k);
             size_t rotBytesBase  = 0; // TODO
+
+            // Verify ring dimension
+            uint32_t actualRingDim = ccBatch->GetRingDimension();
+            if (actualRingDim != ps.ringDim) {
+                std::cerr << "WARNING: Ring dimension mismatch! Set=" << ps.ringDim
+                          << ", Actual=" << actualRingDim << "\n";
+            }
 
             auto pinfo = GetPInfo(ccBatch);
             auto qinfo = GetQInfo(ccBatch);
-            std::cout << "[k="<<k<<"] P_k="<<pinfo.kP
+            std::cout << "[k="<<k<<"] N(actual)="<<actualRingDim
+                      << " | P_k="<<pinfo.kP
                       << ", sum log2(P)≈"<<std::fixed<<std::setprecision(1)<<pinfo.sumLogP
                       << " bits, P bits: ["<<JoinBits(pinfo.bits)<<"]\n";
             std::cout << "         Q_l="<<qinfo.lQ
                       << ", sum log2(Q)≈"<<std::fixed<<std::setprecision(1)<<qinfo.sumLogQ
                       << " bits, Q bits: ["<<JoinBits(qinfo.bits)<<"]\n";
+
+            // Collect timing statistics across trials
+            std::vector<double> base_times, batched_times;
+            base_times.reserve(trials);
+            batched_times.reserve(trials);
+            double max_err_base = 0.0, max_err_batched = 0.0, max_err_between = 0.0;
 
             for (int t=0;t<trials;++t){
                 // Warm-ups (per context)
@@ -382,29 +399,12 @@ int main(int argc, char** argv){
                 double err_batched  = MaxAbsErr(batch_vec, ref);
                 double err_between  = MaxAbsErr(base_vec,  batch_vec);
 
-                // Console
-                std::cout << "k="<<std::setw(3)<<k
-                          << " | trial "<<t
-                          << " | baseline "<<std::setw(8)<<std::fixed<<std::setprecision(3)<<base.ms<<" ms"
-                          << " | batched "<<std::setw(8)<<batched.ms<<" ms"
-                          << " | speedup "<< (base.ms / std::max(1e-9, batched.ms)) << "x\n"
-                          << "    base KS phases(ms)[calls]: "
-                          << "modup="   << base.phases.modup_ms   << "(" << base.phases.modup_calls   << "), "
-                          << "inner="   << base.phases.inner_ms   << "(" << base.phases.inner_calls   << "), "
-                          << "moddown=" << base.phases.moddown_ms << "(" << base.phases.moddown_calls << ")\n"
-                          << "    bat  KS phases(ms)[calls]: "
-                          << "modup="   << batched.phases.modup_ms   << "(" << batched.phases.modup_calls   << "), "
-                          << "inner="   << batched.phases.inner_ms   << "(" << batched.phases.inner_calls   << "), "
-                          << "moddown=" << batched.phases.moddown_ms << "(" << batched.phases.moddown_calls << ")\n"
-                          << "    err(base,batched,between)=("
-                          << std::setprecision(6) << err_baseline << ", "
-                          << err_batched << ", "
-                          << err_between << ")\n"
-                          << std::fixed << std::setprecision(2)
-                          << "    mem: ct_base=" << ToMB(base.ctBytes) << " MB"
-                          << ", ct_batched_preKS=" << ToMB(batched.ctBytes) << " MB"
-                          << ", rotKeys_base=" << ToMB(rotBytesBase) << " MB"
-                          << ", rotKeys_batched=" << ToMB(rotBytesBatch) << " MB\n";
+                // Collect statistics
+                base_times.push_back(base.ms);
+                batched_times.push_back(batched.ms);
+                max_err_base = std::max(max_err_base, err_baseline);
+                max_err_batched = std::max(max_err_batched, err_batched);
+                max_err_between = std::max(max_err_between, err_between);
 
                 // CSV
                 csv << ps.name << "," << ccBatch->GetRingDimension() << ","
@@ -430,6 +430,27 @@ int main(int argc, char** argv){
                     TrimMalloc();
                 }
             }
+
+            // Compute and print summary statistics for this k
+            auto compute_stats = [](const std::vector<double>& v) {
+                double mean = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
+                double sq_sum = 0.0;
+                for (double x : v) sq_sum += (x - mean) * (x - mean);
+                double stddev = std::sqrt(sq_sum / v.size());
+                return std::make_pair(mean, stddev);
+            };
+
+            auto [base_mean, base_std] = compute_stats(base_times);
+            auto [bat_mean, bat_std] = compute_stats(batched_times);
+            double speedup = base_mean / std::max(1e-9, bat_mean);
+
+            std::cout << "k="<<std::setw(3)<<k<<" | "<<trials<<" trials completed\n"
+                      << "  baseline: "<<std::fixed<<std::setprecision(3)<<base_mean<<" ± "<<base_std<<" ms\n"
+                      << "  batched:  "<<bat_mean<<" ± "<<bat_std<<" ms\n"
+                      << "  speedup:  "<<std::setprecision(2)<<speedup<<"x\n"
+                      << "  max errors: base="<<std::setprecision(6)<<max_err_base
+                      << ", batched="<<max_err_batched
+                      << ", between="<<max_err_between<<"\n";
 
             std::cout << std::endl;
 

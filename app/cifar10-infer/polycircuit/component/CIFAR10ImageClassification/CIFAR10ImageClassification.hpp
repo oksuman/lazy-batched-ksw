@@ -56,6 +56,7 @@ public:
         m_inputC = m_cc->EvalAdd(m_inputC, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(0)));
         m_inputC = m_cc->EvalMult(m_inputC, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(1)));
 
+        // m_inputC -> T1(X) = X 
         lbcrypto::Ciphertext<ElementType> tmp = m_cc->EvalMult(m_inputC, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(2)));
         lbcrypto::Ciphertext<ElementType> enc_out = m_cc->EvalAdd(tmp, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(3)));
         tmp = m_cc->EvalMult(m_inputC, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(4)));
@@ -68,9 +69,10 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // t_0 -> T2(X) = 2X^2 - 1 
         lbcrypto::Ciphertext<ElementType> t0 = m_cc->EvalMult(m_inputC, m_inputC);
         t0 = m_cc->EvalAdd(t0, t0);
-        t0 = m_cc->EvalSub(t0, 1);
+        t0 = m_cc->EvalSub(t0, 1); 
         tmp = m_cc->EvalMult(t0, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(7)));
         enc_out = m_cc->EvalAdd(tmp, enc_out);
         tmp = m_cc->EvalMult(t0, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(8)));
@@ -83,6 +85,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // t_1 -> T3(X) = 2X * T2(X) - X 
         lbcrypto::Ciphertext<ElementType> t1 = m_cc->EvalMult(t0, m_inputC);
         t1 = m_cc->EvalAdd(t1, t1);
         t1 = m_cc->EvalSub(t1, m_inputC);
@@ -98,6 +101,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // t_2 -> T4(X) = 2T2(X)^2 - 1 
         lbcrypto::Ciphertext<ElementType> t2 = m_cc->EvalMult(t0, t0);
         t2 = m_cc->EvalAdd(t2, t2);
         t2 = m_cc->EvalSub(t2, 1);
@@ -113,6 +117,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // t_3 -> T5(X) 
         lbcrypto::Ciphertext<ElementType> t3 = m_cc->EvalMult(t2, m_inputC);
         t3 = m_cc->EvalAdd(t3, t3);
         t3 = m_cc->EvalSub(t3, t1);
@@ -128,6 +133,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // t_4 -> T6(X) 
         lbcrypto::Ciphertext<ElementType> t4 = m_cc->EvalMult(t2, t0);
         t4 = m_cc->EvalAdd(t4, t4);
         t4 = m_cc->EvalSub(t4, t0);
@@ -143,6 +149,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // REUSE t_0 -> T7(X) 
         t0 = m_cc->EvalMult(t2, t1);
         t0 = m_cc->EvalAdd(t0, t0);
         t0 = m_cc->EvalSub(t0, m_inputC);
@@ -158,6 +165,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
+        // REUSE t_1 -> T8(X) 
         t1 = m_cc->EvalMult(t2, t2);
         t1 = m_cc->EvalAdd(t1, t1);
         t1 = m_cc->EvalSub(t1, 1);
@@ -172,6 +180,10 @@ public:
         tmp = m_cc->EvalMult(t1, m_cc->MakeCKKSPackedPlaintext(weightsMatrix.at(34)));
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
+
+
+
+        // Folding Sum
         tmp = m_cc->EvalRotate(enc_out, 1600);
         enc_out = m_cc->EvalAdd(enc_out, tmp);
         tmp = m_cc->EvalRotate(enc_out, 800);

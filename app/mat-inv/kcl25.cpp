@@ -464,6 +464,10 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse(const Ciphertext<DCRTPoly>& M) {
         Y     = eval_mult(Y, m_cc->EvalAdd(pI, A_bar));
         A_bar = eval_mult(A_bar, A_bar);
     }
+    if (d >= 8 && static_cast<int>(Y->GetLevel()) >= depth - 2) {
+        A_bar = m_cc->EvalBootstrap(A_bar);
+        Y     = m_cc->EvalBootstrap(Y);
+    }
     Y = eval_mult(Y, m_cc->EvalAdd(pI, A_bar));
 
     return Y;
@@ -489,6 +493,10 @@ Ciphertext<DCRTPoly> MATINV_KCL25::eval_inverse_lazy(const Ciphertext<DCRTPoly>&
         }
         Y     = eval_mult_lazy(Y, m_cc->EvalAdd(pI, A_bar));
         A_bar = eval_mult_lazy(A_bar, A_bar);
+    }
+    if (d >= 8 && static_cast<int>(Y->GetLevel()) >= depth - 2) {
+        A_bar = m_cc->EvalBootstrap(A_bar);
+        Y     = m_cc->EvalBootstrap(Y);
     }
     Y = eval_mult_lazy(Y, m_cc->EvalAdd(pI, A_bar));
 
