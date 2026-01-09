@@ -426,7 +426,7 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::eval_mult_lazy(const Ciphertext<DCRTPoly>& 
     auto sigma_A = sigmaTransformLazy(matA);
     auto tau_B = tauTransformLazy(matB);
     auto matrixC = m_cc->EvalMultAndRelinearize(sigma_A, tau_B);
-    
+
     for (int i = 1; i < d; i++) {
         auto shifted_A = columnShiftingLazy(sigma_A, i);
         tau_B = m_cc->EvalBatchedKS(m_cc->EvalLazyRotate(tau_B, d));
@@ -434,4 +434,190 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::eval_mult_lazy(const Ciphertext<DCRTPoly>& 
             matrixC, m_cc->EvalMultAndRelinearize(shifted_A, tau_B));
     }
     return matrixC;
+}
+
+// ---------------------- Plan functions ----------------------
+void MATMULT_JKLS18::eval_mult_plan(RotationKeyCollector& rk) const {
+    const int num_slots = d * d;
+    rk.begin(num_slots, false);
+
+    double squareRootd = sqrt(static_cast<double>(d));
+    int bs = static_cast<int>(round(squareRootd));
+
+    std::cout << "        [Plan] d=" << d << ", num_slots=" << num_slots << ", bs=" << bs << "\n";
+    std::vector<int> collected;
+
+    // sigmaTransform rotations
+    for (int i = 0; i < bs; i++) {
+        rk.observe(i);
+        collected.push_back(i);
+    }
+    for (int i = 1; i < d - bs * (bs - 1); i++) {
+        rk.observe(i - d);
+        collected.push_back(i - d);
+    }
+    for (int i = -(bs - 1); i < bs; i++) {
+        rk.observe(bs * i);
+        collected.push_back(bs * i);
+    }
+
+    // tauTransform rotations
+    int squareRootIntd = static_cast<int>(squareRootd);
+    if (squareRootIntd * squareRootIntd == d) {
+        for (int i = 0; i < squareRootIntd; i++) {
+            rk.observe(d * i);
+            collected.push_back(d * i);
+        }
+        for (int i = 0; i < squareRootIntd; i++) {
+            rk.observe(squareRootIntd * d * i);
+            collected.push_back(squareRootIntd * d * i);
+        }
+    } else {
+        int steps = bs;
+        for (int i = 0; i < steps; i++) {
+            rk.observe(d * i);
+            collected.push_back(d * i);
+        }
+        for (int i = 0; i < d - steps * (steps - 1); i++) {
+            rk.observe((steps * (steps - 1) + i) * d);
+            collected.push_back((steps * (steps - 1) + i) * d);
+        }
+        for (int i = 0; i < steps - 1; i++) {
+            rk.observe(steps * d * i);
+            collected.push_back(steps * d * i);
+        }
+    }
+
+    // columnShifting rotations for i in 1..d-1
+    for (int l = 1; l < d; l++) {
+        rk.observe(l - d);
+        rk.observe(l);
+        collected.push_back(l - d);
+        collected.push_back(l);
+    }
+
+    // Main loop: tau_B rotation by d (always just d, not cumulative)
+    rk.observe(d);
+    collected.push_back(d);
+
+    std::cout << "        [Plan] Collected " << collected.size() << " rotation indices (with duplicates):\n        ";
+    for (size_t i = 0; i < std::min<size_t>(30, collected.size()); ++i) {
+        std::cout << collected[i] << " ";
+    }
+    if (collected.size() > 30) std::cout << "...";
+    std::cout << "\n";
+}
+
+void MATMULT_JKLS18::eval_mult_hoist_plan(RotationKeyCollector& rk) const {
+    // Hoisting uses same rotation pattern as baseline
+    eval_mult_plan(rk);
+}
+
+void MATMULT_JKLS18::eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const {
+    const int num_slots = d * d;
+    rk.begin(num_slots);
+
+    // Helper to create zero ciphertext
+    auto makeZeroCT = [&]() {
+        std::vector<double> zero(num_slots, 0.0);
+        auto pt = m_cc->MakeCKKSPackedPlaintext(zero);
+        return m_cc->Encrypt(m_PublicKey, pt);
+    };
+
+    double squareRootd = sqrt(static_cast<double>(d));
+    int squareRootIntd = static_cast<int>(squareRootd);
+    int bs = (squareRootIntd * squareRootIntd == 0) ? squareRootIntd : static_cast<int>(round(squareRootd));
+
+    // Simulate sigmaTransformLazy
+    {
+        auto sigma_M = makeZeroCT();
+        auto M = makeZeroCT();
+
+        // babySteps - each one has individual batched KS
+        for (int i = 0; i < bs; i++) {
+            auto ct = m_cc->EvalLazyRotate(M, i);
+            rk.observeAutoIndices(ct->GetElementKeyIndexVector());  // EvalBatchedKS point
+        }
+
+        // Second loop - accumulates lazy rotations into sigma_M
+        for (int i = 1; i < d - bs * (bs - 1); i++) {
+            // EvalMult with plaintext doesn't affect automorphism
+            // We just need to accumulate the lazy rotation
+            sigma_M = m_cc->EvalLazyAdd(sigma_M, m_cc->EvalLazyRotate(M, i - d));
+        }
+
+        // Third loop - accumulates more lazy rotations into sigma_M
+        for (int i = -(bs - 1); i < bs; i++) {
+            // tmp stays clean (already batched KS'ed in real code)
+            // We just add the rotation to sigma_M
+            sigma_M = m_cc->EvalLazyAdd(sigma_M, m_cc->EvalLazyRotate(makeZeroCT(), bs * i));
+        }
+
+        // Final EvalBatchedKS on sigma_M - observe all accumulated automorphisms
+        rk.observeAutoIndices(sigma_M->GetElementKeyIndexVector());
+    }
+
+    // Simulate tauTransformLazy
+    {
+        auto tau_M = makeZeroCT();
+        auto M = makeZeroCT();
+
+        if (squareRootIntd * squareRootIntd == d) {
+            // babySteps - each has individual batched KS
+            for (int i = 0; i < squareRootIntd; i++) {
+                auto ct = m_cc->EvalLazyRotate(M, d * i);
+                rk.observeAutoIndices(ct->GetElementKeyIndexVector());  // EvalBatchedKS point
+            }
+
+            // Accumulate lazy rotations into tau_M
+            for (int i = 0; i < squareRootIntd; i++) {
+                tau_M = m_cc->EvalLazyAdd(tau_M, m_cc->EvalLazyRotate(makeZeroCT(), squareRootIntd * d * i));
+            }
+        } else {
+            int steps = bs;
+
+            // babySteps - each has individual batched KS
+            for (int i = 0; i < steps; i++) {
+                auto ct = m_cc->EvalLazyRotate(M, d * i);
+                rk.observeAutoIndices(ct->GetElementKeyIndexVector());  // EvalBatchedKS point
+            }
+
+            // Accumulate lazy rotations
+            for (int i = 0; i < d - steps * (steps - 1); i++) {
+                tau_M = m_cc->EvalLazyAdd(tau_M, m_cc->EvalLazyRotate(M, (steps * (steps - 1) + i) * d));
+            }
+
+            for (int i = 0; i < steps - 1; i++) {
+                tau_M = m_cc->EvalLazyAdd(tau_M, m_cc->EvalLazyRotate(makeZeroCT(), steps * d * i));
+            }
+        }
+
+        // Final EvalBatchedKS on tau_M - observe all accumulated automorphisms
+        rk.observeAutoIndices(tau_M->GetElementKeyIndexVector());
+    }
+
+    // Simulate eval_mult_lazy main loop
+    {
+        auto sigma_A = makeZeroCT();
+        auto tau_B = makeZeroCT();
+
+        for (int i = 1; i < d; i++) {
+            // columnShiftingLazy simulation
+            // Real code: EvalLazySub, then two rotations, then EvalLazyAdd, then EvalBatchedKS
+            {
+                auto M = sigma_A;  // Use sigma_A as source
+                auto temp1 = makeZeroCT();  // Simulates EvalLazySub result
+                auto ct1 = m_cc->EvalLazyRotate(temp1, i - d);
+                auto temp2 = makeZeroCT();  // Simulates the masked part
+                auto ct2 = m_cc->EvalLazyRotate(temp2, i);
+                auto shifted = m_cc->EvalLazyAdd(ct1, ct2);
+                rk.observeAutoIndices(shifted->GetElementKeyIndexVector());  // EvalBatchedKS point
+            }
+
+            // tau_B = EvalBatchedKS(EvalLazyRotate(tau_B, d))
+            // Since tau_B accumulates from previous iterations
+            tau_B = m_cc->EvalLazyRotate(tau_B, d);
+            rk.observeAutoIndices(tau_B->GetElementKeyIndexVector());  // EvalBatchedKS point
+        }
+    }
 }

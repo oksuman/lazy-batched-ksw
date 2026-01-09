@@ -160,7 +160,7 @@ Ciphertext<DCRTPoly> MATMULT_AR24::eval_mult_lazy(const Ciphertext<DCRTPoly>& ma
             rot_count++;
 
             const bool last = (i == rounds - 1);
-            if (rot_count == 3  || last) {
+            if (rot_count == 2  || last) {
                 matrixA = m_cc->EvalBatchedKS(matrixA);
                 rot_count = 0;
             }
@@ -176,7 +176,7 @@ Ciphertext<DCRTPoly> MATMULT_AR24::eval_mult_lazy(const Ciphertext<DCRTPoly>& ma
             rot_count++;
 
             const bool last = (i == rounds - 1);
-            if (rot_count == 3  || last) {
+            if (rot_count == 2  || last) {
                 matrixB = m_cc->EvalBatchedKS(matrixB);
                 rot_count = 0;
             }
@@ -204,7 +204,7 @@ Ciphertext<DCRTPoly> MATMULT_AR24::eval_mult_lazy(const Ciphertext<DCRTPoly>& ma
                 rot_count++;
 
                 const bool last = (j == rounds - 1);
-                if (rot_count == 3  || last) {
+                if (rot_count == 2  || last) {
                     tmp = m_cc->EvalBatchedKS(tmp);
                     rot_count = 0;
                 }
@@ -234,7 +234,7 @@ Ciphertext<DCRTPoly> MATMULT_AR24::eval_mult_lazy(const Ciphertext<DCRTPoly>& ma
                 rot_count++;
 
                 const bool last = (j == rounds - 1);
-                if (rot_count == 3  || last) {
+                if (rot_count == 2  || last) {
                     tmp = m_cc->EvalBatchedKS(tmp);
                     rot_count = 0;
                 }
@@ -258,7 +258,7 @@ Ciphertext<DCRTPoly> MATMULT_AR24::eval_mult_lazy(const Ciphertext<DCRTPoly>& ma
             rot_count++;
 
             const bool last = (i == rounds - 1);
-            if (rot_count == 3  || last) {
+            if (rot_count == 2  || last) {
                 matrixC = m_cc->EvalBatchedKS(matrixC);
                 rot_count = 0;
             }

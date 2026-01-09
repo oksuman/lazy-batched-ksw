@@ -181,8 +181,7 @@ public:
         tmp = m_cc->EvalRotate(tmp, -3);
         enc_out = m_cc->EvalAdd(tmp, enc_out);
 
-
-
+        
         // Folding Sum
         tmp = m_cc->EvalRotate(enc_out, 1600);
         enc_out = m_cc->EvalAdd(enc_out, tmp);

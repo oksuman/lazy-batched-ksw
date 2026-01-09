@@ -3,6 +3,8 @@
 #include <openfhe.h>
 #include <memory>
 #include <vector>
+#include "rotation_collector_base.h"
+#include "rotation_collector_lazy.h"
 
 using namespace lbcrypto;
 
@@ -36,6 +38,11 @@ public:
 
     Ciphertext<DCRTPoly> eval_mult_lazy(const Ciphertext<DCRTPoly>& matA,
                                         const Ciphertext<DCRTPoly>& matB);
+
+    // Plan functions to collect rotation indices
+    void eval_mult_plan(RotationKeyCollector& rk) const;
+    void eval_mult_hoist_plan(RotationKeyCollector& rk) const;
+    void eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const;
 
 private:
     CryptoContext<DCRTPoly> m_cc;
