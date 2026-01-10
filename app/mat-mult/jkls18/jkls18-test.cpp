@@ -191,28 +191,38 @@ struct HoistAdapter : IAlgo {
 };
 #endif
 
+// ---------------- Method enum ----------------
+enum class Method { Baseline, Lazy, Hoist };
+
 // ---------------- Runner ----------------
 template <typename MakeAlgo>
 static std::tuple<Stats, Acc>
 run_one_method(const std::string& label, const Preset& ps, int d, int trials, unsigned seed,
                MakeAlgo makeAlgo,
-               KeySwitchTechnique ksTech, bool useLazy) {
+               KeySwitchTechnique ksTech, Method method) {
     ContextPack ctx = makeContextForD(ps, d, ksTech);
 
-    // Use rotation collector to generate only needed keys
-    if (useLazy) {
-        MATMULT_JKLS18 planner(ctx.cc, ctx.pk, d);
+    // Use rotation collector to generate only needed keys via plan
+    MATMULT_JKLS18 planner(ctx.cc, ctx.pk, d);
+
+    if (method == Method::Lazy) {
         RotationKeyCollectorLazy rkLazy;
         planner.eval_mult_lazy_plan(rkLazy);
         rkLazy.generate(ctx.cc, ctx.sk);
         std::cout << "      [Lazy] Generated " << rkLazy.getCollectedAutoIndices().size()
                   << " rotation keys (automorphism indices)\n";
     } else {
-        // Rotation keys: include 0; cover [-d*d+1, ..., d*d-1]
-        std::vector<int32_t> rotIndices;
-        rotIndices.reserve(2 * d * d - 1);
-        for (int i = -d*d + 1; i < d*d; ++i) rotIndices.push_back(i);
-        ctx.cc->EvalRotateKeyGen(ctx.sk, rotIndices);
+        // Baseline and Hoist: use plan to collect only necessary rotation keys
+        int actualSlots = static_cast<int>(ctx.cc->GetRingDimension() / 2);
+        RotationKeyCollector rk;
+        rk.begin(actualSlots, false);
+        if (method == Method::Hoist) {
+            planner.eval_mult_hoist_plan(rk);
+        } else {  // Baseline
+            planner.eval_mult_plan(rk);
+        }
+        std::cout << "      [" << label << "] Generated " << rk.size() << " rotation keys\n";
+        rk.generate(ctx.cc, ctx.sk);
     }
 
     std::unique_ptr<IAlgo> algo = makeAlgo(ctx.cc, ctx.pk, d);
@@ -293,7 +303,7 @@ static std::vector<Row> run_baseline_suite(const Preset& ps, const std::vector<i
                const PublicKey<DCRTPoly>& pk, int d_) {
                 return std::make_unique<BaselineAdapter>(cc, pk, d_);
             },
-            HYBRID, /*useLazy=*/false
+            HYBRID, Method::Baseline
         );
         rows.push_back({d, st, ac});
         HardReset();
@@ -315,7 +325,7 @@ static std::vector<Row> run_lazy_suite(const Preset& ps, const std::vector<int>&
                const PublicKey<DCRTPoly>& pk, int d_) {
                 return std::make_unique<LazyAdapter>(cc, pk, d_);
             },
-            BATCHED, /*useLazy=*/true
+            BATCHED, Method::Lazy
         );
         rows.push_back({d, st, ac});
         HardReset();
@@ -337,7 +347,7 @@ static std::vector<Row> run_hoist_suite(const Preset& ps, const std::vector<int>
                const PublicKey<DCRTPoly>& pk, int d_) {
                 return std::make_unique<HoistAdapter>(cc, pk, d_);
             },
-            HYBRID, /*useLazy=*/false
+            HYBRID, Method::Hoist
         );
         rows.push_back({d, st, ac});
         HardReset();

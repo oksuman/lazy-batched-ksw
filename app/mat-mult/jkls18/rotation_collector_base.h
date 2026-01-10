@@ -48,9 +48,16 @@ public:
         indices_.clear();
     }
 
+    size_t size() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return indices_.size();
+    }
+
 private:
+    // Normalize rotation index based on slot count
+    // Rotations k and k±slotCount use the same automorphism key
     int32_t normSigned(int v) const {
-        if (slotCount_ <= 0) return 0;
+        if (slotCount_ <= 0) return v;  // Don't normalize if slotCount not set
         int r = v % slotCount_;
         if (r < 0) r += slotCount_;
         if (r > slotCount_ / 2) r -= slotCount_;

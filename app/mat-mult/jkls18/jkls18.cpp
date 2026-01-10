@@ -437,80 +437,47 @@ Ciphertext<DCRTPoly> MATMULT_JKLS18::eval_mult_lazy(const Ciphertext<DCRTPoly>& 
 }
 
 // ---------------------- Plan functions ----------------------
+// Note: Caller must call rk.begin() with appropriate slotCount (ringDim/2) before calling these functions
 void MATMULT_JKLS18::eval_mult_plan(RotationKeyCollector& rk) const {
-    const int num_slots = d * d;
-    rk.begin(num_slots, false);
-
     double squareRootd = sqrt(static_cast<double>(d));
     int bs = static_cast<int>(round(squareRootd));
 
-    std::cout << "        [Plan] d=" << d << ", num_slots=" << num_slots << ", bs=" << bs << "\n";
-    std::vector<int> collected;
-
     // sigmaTransform rotations
-    for (int i = 0; i < bs; i++) {
-        rk.observe(i);
-        collected.push_back(i);
-    }
-    for (int i = 1; i < d - bs * (bs - 1); i++) {
-        rk.observe(i - d);
-        collected.push_back(i - d);
-    }
-    for (int i = -(bs - 1); i < bs; i++) {
-        rk.observe(bs * i);
-        collected.push_back(bs * i);
-    }
+    for (int i = 0; i < bs; i++) rk.observe(i);
+    for (int i = 1; i < d - bs * (bs - 1); i++) rk.observe(i - d);
+    for (int i = -(bs - 1); i < bs; i++) rk.observe(bs * i);
 
     // tauTransform rotations
     int squareRootIntd = static_cast<int>(squareRootd);
     if (squareRootIntd * squareRootIntd == d) {
-        for (int i = 0; i < squareRootIntd; i++) {
-            rk.observe(d * i);
-            collected.push_back(d * i);
-        }
-        for (int i = 0; i < squareRootIntd; i++) {
-            rk.observe(squareRootIntd * d * i);
-            collected.push_back(squareRootIntd * d * i);
-        }
+        for (int i = 0; i < squareRootIntd; i++) rk.observe(d * i);
+        for (int i = 0; i < squareRootIntd; i++) rk.observe(squareRootIntd * d * i);
     } else {
         int steps = bs;
-        for (int i = 0; i < steps; i++) {
-            rk.observe(d * i);
-            collected.push_back(d * i);
-        }
-        for (int i = 0; i < d - steps * (steps - 1); i++) {
-            rk.observe((steps * (steps - 1) + i) * d);
-            collected.push_back((steps * (steps - 1) + i) * d);
-        }
-        for (int i = 0; i < steps - 1; i++) {
-            rk.observe(steps * d * i);
-            collected.push_back(steps * d * i);
-        }
+        for (int i = 0; i < steps; i++) rk.observe(d * i);
+        for (int i = 0; i < d - steps * (steps - 1); i++) rk.observe((steps * (steps - 1) + i) * d);
+        for (int i = 0; i < steps - 1; i++) rk.observe(steps * d * i);
     }
 
-    // columnShifting rotations for i in 1..d-1
+    // columnShifting rotations
     for (int l = 1; l < d; l++) {
         rk.observe(l - d);
         rk.observe(l);
-        collected.push_back(l - d);
-        collected.push_back(l);
     }
 
-    // Main loop: tau_B rotation by d (always just d, not cumulative)
+    // Main loop: tau_B rotation by d
     rk.observe(d);
-    collected.push_back(d);
-
-    std::cout << "        [Plan] Collected " << collected.size() << " rotation indices (with duplicates):\n        ";
-    for (size_t i = 0; i < std::min<size_t>(30, collected.size()); ++i) {
-        std::cout << collected[i] << " ";
-    }
-    if (collected.size() > 30) std::cout << "...";
-    std::cout << "\n";
 }
 
 void MATMULT_JKLS18::eval_mult_hoist_plan(RotationKeyCollector& rk) const {
-    // Hoisting uses same rotation pattern as baseline
+    // Start with baseline rotation pattern
     eval_mult_plan(rk);
+
+    // Hoisting-specific: main loop uses EvalFastRotation(tau_B, d*i)
+    // instead of iterative EvalRotate(tau_B, d), so we need d*i for i in [1, d)
+    for (int i = 1; i < d; i++) {
+        rk.observe(d * i);
+    }
 }
 
 void MATMULT_JKLS18::eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const {

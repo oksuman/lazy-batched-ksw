@@ -1,2 +1,0 @@
-terminate called after throwing an instance of 'lbcrypto::OpenFHEException'
-  what():  /home/user/shkim/lazy-batched-ksw/openfhe-development/src/pke/lib/schemebase/base-leveledshe.cpp:l.782:EvalBatchedKS(): EvalBatchedKS: EvalKey for automorphism index [32577] not found.

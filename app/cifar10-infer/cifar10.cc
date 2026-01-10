@@ -51,7 +51,7 @@ struct ParamSet {
 
 std::vector<ParamSet> get_param_sets() {
     return {
-        {"N=2^13", 1u << 13, 5, 20, 30},
+        // {"N=2^13", 1u << 13, 5, 20, 30},
         {"N=2^14", 1u << 14, 7, 34, 46},
         {"N=2^15", 1u << 15, 13, 40, 51},
         {"N=2^16", 1u << 16, 24, 45, 56}
@@ -172,7 +172,7 @@ int main(int argc, char* argv[]) try {
     po::options_description desc("Allowed parameters");
     desc.add_options()
         ("help,h", "produce help message")
-        ("repetitions,r", po::value<int>()->default_value(5), "number of repetitions per image (default: 5)")
+        ("repetitions,r", po::value<int>()->default_value(25), "number of repetitions per image (default: 5)")
         ("threads,t", po::value<std::string>()->default_value("1,32"), "comma-separated thread counts (default: 1,32)");
 
     po::variables_map vm;
