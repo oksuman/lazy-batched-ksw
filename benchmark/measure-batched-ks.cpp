@@ -1,4 +1,3 @@
-// measure_batched_ks.cpp
 #include "openfhe.h"
 
 #include "ciphertext-ser.h"
@@ -47,16 +46,6 @@ static size_t CiphertextSizeBytes(const lbcrypto::Ciphertext<lbcrypto::DCRTPoly>
 static inline double ToMB(size_t bytes) {
     return static_cast<double>(bytes) / 1'000'000.0; // SI MB
 }
-
-// Rotation keys size (all automorphism keys currently loaded in cc)
-// static size_t RotationKeysSizeBytes(const lbcrypto::CryptoContext<lbcrypto::DCRTPoly>& cc) {
-//     std::stringstream ss;
-//     bool ok = cc->SerializeEvalAutomorphismKey(ss, lbcrypto::SerType::BINARY); 
-//     if (!ok) return 0;
-//     std::streampos pos = ss.tellp();
-//     return (pos >= 0) ? static_cast<size_t>(pos) : 0;
-// }
-
 
 // -------- Helpers: bit-length from NativeInteger --------
 static inline double BitsOf(const NativeInteger& x){
@@ -169,7 +158,6 @@ static std::vector<Preset> MakePresets(){
         {"N=2^14", 1<<14, 7, 34, 46, HEStd_128_classic, 128},
         {"N=2^15", 1<<15, 13, 40, 51, HEStd_128_classic, 128},
         {"N=2^16", 1<<16, 24, 45, 56, HEStd_128_classic, 128},
-        // {"N=2^17", 1<<17, 38, 50, 61, HEStd_128_classic, 128}
     };
 }
 

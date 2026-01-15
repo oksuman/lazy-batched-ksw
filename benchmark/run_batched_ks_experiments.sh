@@ -1,5 +1,3 @@
-#!/bin/bash
-
 # ============================================================
 # Batched Key-Switching Benchmark Script
 # ============================================================
@@ -15,12 +13,12 @@
 # EXPERIMENTS:
 #   - Rotation counts k: {2, 4, 8, 16, 32, 64}
 #   - 100 trials per (parameter set, k) combination
-#   - OMP_NUM_THREADS = 1 (single-threaded) and 32 (multi-threaded)
+#   - OMP_NUM_THREADS = 1 (single-threaded) and 8 (can be changed depending on system) (multi-threaded)
 #
 # OUTPUT:
 #   Results saved in batched_ks_results/ directory:
 #     - timings_threads1.csv  (single-threaded results)
-#     - timings_threads32.csv (multi-threaded results)
+#     - timings_threads8.csv (multi-threaded results)
 #
 #   Each CSV contains for every trial:
 #     - Parameter info: preset, N, depth_L, scalingBits, firstModBits
@@ -34,11 +32,6 @@
 #   chmod +x run_batched_ks_experiments.sh
 #   ./run_batched_ks_experiments.sh
 #
-#
-# PERFORMANCE ISOLATION:
-#   - 20-second cooldown between thread configurations
-#   - Each trial includes warm-up runs
-#   - Consider running in single-user mode for consistent results
 #
 # ============================================================
 
@@ -59,13 +52,9 @@ echo "Configuration:"
 echo "  - Trials per (preset, k): ${TRIALS}"
 echo "  - Parameter sets: N=2^14, N=2^15, N=2^16"
 echo "  - Rotation counts k: {2, 4, 8, 16, 32, 64}"
-echo "  - Thread configurations: 1, 32"
+echo "  - Thread configurations: 1, 8"
 echo ""
-echo "Performance isolation settings:"
-echo "  - 20s cooldown between thread configurations"
-echo "  - Each trial includes warm-up runs"
-echo "  - Total expected runtime: ~30-90 minutes"
-echo ""
+
 
 # Create results directory
 RESULTS_DIR="${SCRIPT_DIR}/batched_ks_results"
@@ -99,7 +88,6 @@ echo ""
 # ============================================================
 echo "[2/3] Running single-threaded experiment (OMP_NUM_THREADS=1)..."
 echo "  This will run 3 parameter sets × 6 k-values × ${TRIALS} trials"
-echo "  Estimated time: 15-45 minutes"
 echo ""
 
 cd "${BUILD_DIR}"
@@ -118,20 +106,20 @@ sleep 20
 echo ""
 
 # ============================================================
-# Multi-threaded experiment (OMP_NUM_THREADS=32)
+# Multi-threaded experiment (OMP_NUM_THREADS=8)
 # ============================================================
-echo "[3/3] Running multi-threaded experiment (OMP_NUM_THREADS=32)..."
+echo "[3/3] Running multi-threaded experiment (OMP_NUM_THREADS=8)..."
 echo "  This will run 3 parameter sets × 6 k-values × ${TRIALS} trials"
 echo "  Estimated time: 15-45 minutes"
 echo ""
 
 cd "${BUILD_DIR}"
-OMP_NUM_THREADS=32 LD_LIBRARY_PATH="${OPENFHE_LIB}:$LD_LIBRARY_PATH" ./measure-batched-ks ${TRIALS}
+OMP_NUM_THREADS=8 LD_LIBRARY_PATH="${OPENFHE_LIB}:$LD_LIBRARY_PATH" ./measure-batched-ks ${TRIALS}
 
 if [ -f "timings.csv" ]; then
-    mv timings.csv "${RESULTS_DIR}/timings_threads32.csv"
+    mv timings.csv "${RESULTS_DIR}/timings_threads8.csv"
     echo ""
-    echo "  Multi-threaded results saved to: ${RESULTS_DIR}/timings_threads32.csv"
+    echo "  Multi-threaded results saved to: ${RESULTS_DIR}/timings_threads8.csv"
 else
     echo "  Warning: timings.csv not found"
 fi
@@ -149,12 +137,11 @@ echo "Results directory: ${RESULTS_DIR}"
 echo ""
 echo "Generated files:"
 echo "  - timings_threads1.csv   (single-threaded: OMP_NUM_THREADS=1)"
-echo "  - timings_threads32.csv  (multi-threaded: OMP_NUM_THREADS=32)"
+echo "  - timings_threads8.csv   (multi-threaded: OMP_NUM_THREADS=8)"
 echo ""
 echo "Each CSV contains ${TRIALS} trials for:"
 echo "  - 3 parameter sets (N=2^14, 2^15, 2^16)"
 echo "  - 6 rotation counts k (2, 4, 8, 16, 32, 64)"
-echo "  - Total rows per file: ~1800 (3 × 6 × 100)"
 echo ""
 echo "CSV columns include:"
 echo "  - Timing: ms_baseline, ms_batched, speedup"
