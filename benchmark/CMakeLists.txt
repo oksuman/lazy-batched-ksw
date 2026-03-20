@@ -36,3 +36,9 @@ else()
 endif()
 
 add_executable( measure-batched-ks measure-batched-ks.cpp )
+add_executable( measure-unit-ops measure-unit-ops.cpp )
+
+find_package(OpenMP QUIET)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(measure-unit-ops PRIVATE OpenMP::OpenMP_CXX)
+endif()

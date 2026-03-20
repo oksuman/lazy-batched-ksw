@@ -38,12 +38,10 @@ endif()
 ### EXAMPLE:
 ### add_executable( test demo-simple-example.cpp )
 
-find_package(Boost REQUIRED COMPONENTS program_options)
-
 # Add local polycircuit include directory
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${CMAKE_SOURCE_DIR}/../../utils)
 
 add_executable(cifar cifar10.cc)
-target_link_libraries(cifar ${Boost_PROGRAM_OPTIONS_LIBRARY})
 set_target_properties(cifar PROPERTIES DEBUG_POSTFIX ${CMAKE_DEBUG_POSTFIX})
 

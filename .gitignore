@@ -39,3 +39,4 @@ build/
 CLAUDE.md 
 BUGFIXES.md
 .claude/
+.DS_Store

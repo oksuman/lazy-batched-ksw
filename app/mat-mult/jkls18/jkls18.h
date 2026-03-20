@@ -39,9 +39,16 @@ public:
     Ciphertext<DCRTPoly> eval_mult_lazy(const Ciphertext<DCRTPoly>& matA,
                                         const Ciphertext<DCRTPoly>& matB);
 
+    // Double hoisting variants
+    Ciphertext<DCRTPoly> sigmaTransformDoubleHoist(const Ciphertext<DCRTPoly> &M);
+    Ciphertext<DCRTPoly> tauTransformDoubleHoist(const Ciphertext<DCRTPoly> &M);
+    Ciphertext<DCRTPoly> eval_mult_double_hoist(const Ciphertext<DCRTPoly>& matA,
+                                                const Ciphertext<DCRTPoly>& matB);
+
     // Plan functions to collect rotation indices
     void eval_mult_plan(RotationKeyCollector& rk) const;
     void eval_mult_hoist_plan(RotationKeyCollector& rk) const;
+    void eval_mult_double_hoist_plan(RotationKeyCollector& rk) const;
     void eval_mult_lazy_plan(RotationKeyCollectorLazy& rk) const;
 
 private:

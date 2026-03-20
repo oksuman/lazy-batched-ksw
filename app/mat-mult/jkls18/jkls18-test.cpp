@@ -13,40 +13,32 @@
 #include <vector>
 #include <fstream>
 #include <cstdlib>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #include "openfhe.h"
 #include "jkls18.h"
 #include "rotation_collector_base.h"
 #include "rotation_collector_lazy.h"
+#include "memory_tracker.h"
 
 using namespace lbcrypto;
 
-// -------- Toggle experiments (uncomment to enable) --------
+// -------- Toggle experiments --------
 #define RUN_BASELINE 1
-#define RUN_LAZY 1
 #define RUN_HOIST 1
-// ---------------------------------------------------------
-
-#if defined(__GLIBC__)
-  #include <malloc.h>
-  static inline void TrimMalloc() { malloc_trim(0); }
-#else
-  static inline void TrimMalloc() {}
-#endif
-
-static inline void HardReset() {
-    lbcrypto::CryptoContextFactory<lbcrypto::DCRTPoly>::ReleaseAllContexts();
-    TrimMalloc();
-}
+#define RUN_DOUBLE_HOIST 1
+#define RUN_LAZY 1
+// ------------------------------------
 
 // ================= User-tunable =================
 static const int      kTrials = 1;
 static const unsigned kSeed   = 1337u;
-static const int      kDims[] = {8, 16, 32, 64};
+static const int      kDims[] = {8};
 static const char*    kCSV    = "jkls18_bench_results.csv";
 // ================================================
 
-// -------- Parameter presets (from benchmark) --------
+// -------- Parameter presets --------
 struct Preset {
     std::string name;
     uint32_t ringDim;
@@ -59,8 +51,8 @@ struct Preset {
 static std::vector<Preset> MakePresets() {
     return {
         {"N=2^14", 1<<14, 7, 34, 46, HEStd_128_classic},
-        {"N=2^15", 1<<15, 13, 40, 51, HEStd_128_classic},
-        {"N=2^16", 1<<16, 24, 45, 56, HEStd_128_classic}
+        // {"N=2^15", 1<<15, 13, 40, 51, HEStd_128_classic},
+        // {"N=2^16", 1<<16, 24, 45, 56, HEStd_128_classic}
     };
 }
 
@@ -110,7 +102,6 @@ struct ContextPack {
     CryptoContext<DCRTPoly> cc;
     PublicKey<DCRTPoly>     pk;
     PrivateKey<DCRTPoly>    sk;
-    int num_slots{0};
 };
 
 static ContextPack makeContextForD(const Preset& ps, int d, KeySwitchTechnique ksTech) {
@@ -132,7 +123,7 @@ static ContextPack makeContextForD(const Preset& ps, int d, KeySwitchTechnique k
     auto kp = cc->KeyGen();
     cc->EvalMultKeyGen(kp.secretKey);
 
-    return {cc, kp.publicKey, kp.secretKey, d * d};
+    return {cc, kp.publicKey, kp.secretKey};
 }
 
 // ---------------- Encryption helper ----------------
@@ -144,225 +135,172 @@ encryptMatrix(const CryptoContext<DCRTPoly>& cc,
     return cc->Encrypt(pk, pt);
 }
 
-// ---------------- Adapters ----------------
-struct IAlgo {
-    virtual ~IAlgo() = default;
-    virtual std::string getName() const = 0;
-    virtual Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& A,
-                                           const Ciphertext<DCRTPoly>& B) = 0;
-};
-
-#ifdef RUN_BASELINE
-struct BaselineAdapter : IAlgo {
-    MATMULT_JKLS18 impl;
-    BaselineAdapter(const CryptoContext<DCRTPoly>& cc,
-                    const PublicKey<DCRTPoly>& pk, int d) : impl(cc, pk, d) {}
-    std::string getName() const override { return "Baseline"; }
-    Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& A,
-                                   const Ciphertext<DCRTPoly>& B) override {
-        return impl.eval_mult(A, B);
-    }
-};
-#endif
-
-#ifdef RUN_LAZY
-struct LazyAdapter : IAlgo {
-    MATMULT_JKLS18 impl;
-    LazyAdapter(const CryptoContext<DCRTPoly>& cc,
-                const PublicKey<DCRTPoly>& pk, int d) : impl(cc, pk, d) {}
-    std::string getName() const override { return "Lazy"; }
-    Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& A,
-                                   const Ciphertext<DCRTPoly>& B) override {
-        return impl.eval_mult_lazy(A, B);
-    }
-};
-#endif
-
-#ifdef RUN_HOIST
-struct HoistAdapter : IAlgo {
-    MATMULT_JKLS18 impl;
-    HoistAdapter(const CryptoContext<DCRTPoly>& cc,
-                 const PublicKey<DCRTPoly>& pk, int d) : impl(cc, pk, d) {}
-    std::string getName() const override { return "Hoist"; }
-    Ciphertext<DCRTPoly> eval_mult(const Ciphertext<DCRTPoly>& A,
-                                   const Ciphertext<DCRTPoly>& B) override {
-        return impl.eval_mult_hoist(A, B);
-    }
-};
-#endif
-
 // ---------------- Method enum ----------------
-enum class Method { Baseline, Lazy, Hoist };
+enum class Method { Baseline, Lazy, Hoist, DoubleHoist };
 
-// ---------------- Runner ----------------
-template <typename MakeAlgo>
-static std::tuple<Stats, Acc>
-run_one_method(const std::string& label, const Preset& ps, int d, int trials, unsigned seed,
-               MakeAlgo makeAlgo,
-               KeySwitchTechnique ksTech, Method method) {
-    ContextPack ctx = makeContextForD(ps, d, ksTech);
+// Result communicated from child to parent via pipe
+struct BenchResult {
+    double mean_ms;
+    double std_ms;
+    double max_abs_err;
+    double mse;
+    double peak_rss_mb;
+};
 
-    // Use rotation collector to generate only needed keys via plan
-    MATMULT_JKLS18 planner(ctx.cc, ctx.pk, d);
+// Run a single method benchmark in a forked child process for fair peak RSS measurement.
+static BenchResult run_in_subprocess(
+    const Preset& ps, int d, int trials, unsigned seed,
+    Method method)
+{
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        perror("pipe");
+        exit(1);
+    }
 
-    if (method == Method::Lazy) {
-        RotationKeyCollectorLazy rkLazy;
-        planner.eval_mult_lazy_plan(rkLazy);
-        rkLazy.generate(ctx.cc, ctx.sk);
-        std::cout << "      [Lazy] Generated " << rkLazy.getCollectedAutoIndices().size()
-                  << " rotation keys (automorphism indices)\n";
-    } else {
-        // Baseline and Hoist: use plan to collect only necessary rotation keys
-        int actualSlots = static_cast<int>(ctx.cc->GetRingDimension() / 2);
-        RotationKeyCollector rk;
-        rk.begin(actualSlots, false);
-        if (method == Method::Hoist) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+
+    if (pid == 0) {
+        // ---- Child process ----
+        close(pipefd[0]);
+
+        KeySwitchTechnique ksTech = (method == Method::Lazy) ? BATCHED : HYBRID;
+        ContextPack ctx = makeContextForD(ps, d, ksTech);
+
+        // Generate rotation keys (same index set for all methods)
+        MATMULT_JKLS18 planner(ctx.cc, ctx.pk, d);
+        {
+            int actualSlots = static_cast<int>(ctx.cc->GetRingDimension() / 2);
+            RotationKeyCollector rk;
+            rk.begin(actualSlots, method == Method::Lazy);
             planner.eval_mult_hoist_plan(rk);
-        } else {  // Baseline
-            planner.eval_mult_plan(rk);
+            rk.generate(ctx.cc, ctx.sk);
         }
-        std::cout << "      [" << label << "] Generated " << rk.size() << " rotation keys\n";
-        rk.generate(ctx.cc, ctx.sk);
+
+        // Create algo
+        MATMULT_JKLS18 impl(ctx.cc, ctx.pk, d);
+
+        // Prepare test data
+        std::mt19937 gen(seed);
+        std::vector<std::vector<double>> A_set, B_set, C_ref_set;
+        for (int t = 0; t < trials; ++t) {
+            auto A = randomMatrix(d, gen);
+            auto B = randomMatrix(d, gen);
+            auto C = matmulPlain(A, B, d);
+            A_set.emplace_back(std::move(A));
+            B_set.emplace_back(std::move(B));
+            C_ref_set.emplace_back(std::move(C));
+        }
+
+        // Warm-up
+        {
+            auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[0]);
+            auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[0]);
+            Ciphertext<DCRTPoly> ctC;
+            switch (method) {
+                case Method::Baseline:    ctC = impl.eval_mult(ctA, ctB); break;
+                case Method::Hoist:       ctC = impl.eval_mult_hoist(ctA, ctB); break;
+                case Method::DoubleHoist: ctC = impl.eval_mult_double_hoist(ctA, ctB); break;
+                case Method::Lazy:        ctC = impl.eval_mult_lazy(ctA, ctB); break;
+            }
+            Plaintext pt;
+            ctx.cc->Decrypt(ctx.sk, ctC, &pt);
+        }
+
+        // Timed runs
+        std::vector<double> times_ms;
+        double max_abs_err_overall = 0.0;
+        long double mse_sum = 0.0L;
+
+        for (int t = 0; t < trials; ++t) {
+            auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[t]);
+            auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[t]);
+
+            auto t0 = std::chrono::steady_clock::now();
+            Ciphertext<DCRTPoly> ctC;
+            switch (method) {
+                case Method::Baseline:    ctC = impl.eval_mult(ctA, ctB); break;
+                case Method::Hoist:       ctC = impl.eval_mult_hoist(ctA, ctB); break;
+                case Method::DoubleHoist: ctC = impl.eval_mult_double_hoist(ctA, ctB); break;
+                case Method::Lazy:        ctC = impl.eval_mult_lazy(ctA, ctB); break;
+            }
+            auto t1 = std::chrono::steady_clock::now();
+
+            Plaintext pt;
+            ctx.cc->Decrypt(ctx.sk, ctC, &pt);
+            pt->SetLength(d * d);
+            std::vector<double> dec = pt->GetRealPackedValue();
+
+            auto acc = accuracy(dec, C_ref_set[t]);
+            if (acc.max_abs_err > max_abs_err_overall) max_abs_err_overall = acc.max_abs_err;
+            mse_sum += acc.mse;
+
+            double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            times_ms.push_back(ms);
+        }
+
+        Stats st = meanStd(times_ms);
+        BenchResult res;
+        res.mean_ms = st.mean_ms;
+        res.std_ms = st.std_ms;
+        res.max_abs_err = max_abs_err_overall;
+        res.mse = (double)(mse_sum / trials);
+        res.peak_rss_mb = getPeakRSSMB();
+
+        write(pipefd[1], &res, sizeof(res));
+        close(pipefd[1]);
+        _exit(0);
     }
 
-    std::unique_ptr<IAlgo> algo = makeAlgo(ctx.cc, ctx.pk, d);
+    // ---- Parent process ----
+    close(pipefd[1]);
 
-    std::mt19937 gen(seed);
-    std::vector<std::vector<double>> A_set, B_set, C_ref_set;
-    A_set.reserve(trials); B_set.reserve(trials); C_ref_set.reserve(trials);
-    for (int t = 0; t < trials; ++t) {
-        auto A = randomMatrix(d, gen);
-        auto B = randomMatrix(d, gen);
-        auto C = matmulPlain(A, B, d);
-        A_set.emplace_back(std::move(A));
-        B_set.emplace_back(std::move(B));
-        C_ref_set.emplace_back(std::move(C));
+    BenchResult res{};
+    ssize_t n = read(pipefd[0], &res, sizeof(res));
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (n != sizeof(res) || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::cerr << "  ERROR: child process failed\n";
+        return {};
     }
 
-    // warm-up
-    {
-        auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[0]);
-        auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[0]);
-        auto ctC = algo->eval_mult(ctA, ctB);
-        Plaintext pt;
-        ctx.cc->Decrypt(ctx.sk, ctC, &pt);
-        pt->SetLength(d * d);
-        (void)pt->GetRealPackedValue();
-    }
-
-    std::vector<double> times_ms; times_ms.reserve(trials);
-    double max_abs_err_overall = 0.0; long double mse_sum = 0.0L;
-
-    for (int t = 0; t < trials; ++t) {
-        auto ctA = encryptMatrix(ctx.cc, ctx.pk, A_set[t]);
-        auto ctB = encryptMatrix(ctx.cc, ctx.pk, B_set[t]);
-
-        auto t0 = std::chrono::steady_clock::now();
-        auto ctC = algo->eval_mult(ctA, ctB);
-        auto t1 = std::chrono::steady_clock::now();
-
-        Plaintext pt;
-        ctx.cc->Decrypt(ctx.sk, ctC, &pt);
-        pt->SetLength(d * d);
-        std::vector<double> dec = pt->GetRealPackedValue();
-
-        auto acc = accuracy(dec, C_ref_set[t]);
-        if (acc.max_abs_err > max_abs_err_overall) max_abs_err_overall = acc.max_abs_err;
-        mse_sum += acc.mse;
-
-        double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        times_ms.push_back(ms);
-    }
-
-    Stats st = meanStd(times_ms);
-    Acc ac{max_abs_err_overall, (double)(mse_sum / trials)};
-
-    std::cout << "    " << label << " : mean " << std::fixed << std::setprecision(3)
-              << st.mean_ms << " ms, std " << st.std_ms
-              << " ms | max|err| " << std::setprecision(6) << ac.max_abs_err
-              << ", mse " << ac.mse << std::setprecision(3) << "\n";
-
-    ctx.cc->ClearEvalAutomorphismKeys();
-    ctx.cc->ClearEvalMultKeys();
-    return {st, ac};
+    return res;
 }
 
-// ---------------- Suites ----------------
-struct Row { int d; Stats st; Acc ac; };
-
-#ifdef RUN_BASELINE
-static std::vector<Row> run_baseline_suite(const Preset& ps, const std::vector<int>& dims,
-                                           int trials, unsigned seed) {
-    std::vector<Row> rows;
-    std::cout << "  ==== Baseline suite ====\n";
-    for (int d : dims) {
-        std::cout << "    d=" << d << "\n";
-        auto [st, ac] = run_one_method(
-            "Baseline   ", ps, d, trials, seed,
-            [](const CryptoContext<DCRTPoly>& cc,
-               const PublicKey<DCRTPoly>& pk, int d_) {
-                return std::make_unique<BaselineAdapter>(cc, pk, d_);
-            },
-            HYBRID, Method::Baseline
-        );
-        rows.push_back({d, st, ac});
-        HardReset();
+static const char* methodName(Method m) {
+    switch (m) {
+        case Method::Baseline:    return "Baseline";
+        case Method::Hoist:       return "Hoist";
+        case Method::DoubleHoist: return "DoubleHoist";
+        case Method::Lazy:        return "Lazy";
     }
-    return rows;
+    return "Unknown";
 }
-#endif
 
-#ifdef RUN_LAZY
-static std::vector<Row> run_lazy_suite(const Preset& ps, const std::vector<int>& dims,
-                                       int trials, unsigned seed) {
-    std::vector<Row> rows;
-    std::cout << "  ==== Lazy suite ====\n";
-    for (int d : dims) {
-        std::cout << "    d=" << d << "\n";
-        auto [st, ac] = run_one_method(
-            "Lazy       ", ps, d, trials, seed,
-            [](const CryptoContext<DCRTPoly>& cc,
-               const PublicKey<DCRTPoly>& pk, int d_) {
-                return std::make_unique<LazyAdapter>(cc, pk, d_);
-            },
-            BATCHED, Method::Lazy
-        );
-        rows.push_back({d, st, ac});
-        HardReset();
-    }
-    return rows;
-}
-#endif
+// ---------------- Result row ----------------
+struct Row { int d; Stats st; Acc ac; double peak_rss_mb{0.0}; };
 
-#ifdef RUN_HOIST
-static std::vector<Row> run_hoist_suite(const Preset& ps, const std::vector<int>& dims,
-                                        int trials, unsigned seed) {
-    std::vector<Row> rows;
-    std::cout << "  ==== Hoist suite ====\n";
-    for (int d : dims) {
-        std::cout << "    d=" << d << "\n";
-        auto [st, ac] = run_one_method(
-            "Hoist      ", ps, d, trials, seed,
-            [](const CryptoContext<DCRTPoly>& cc,
-               const PublicKey<DCRTPoly>& pk, int d_) {
-                return std::make_unique<HoistAdapter>(cc, pk, d_);
-            },
-            HYBRID, Method::Hoist
-        );
-        rows.push_back({d, st, ac});
-        HardReset();
-    }
-    return rows;
+static Row run_method_for_dim(const Preset& ps, int d, int trials, unsigned seed, Method method) {
+    std::cout << "    d=" << d << " [" << methodName(method) << "] ... " << std::flush;
+    auto res = run_in_subprocess(ps, d, trials, seed, method);
+    std::cout << std::fixed << std::setprecision(3) << res.mean_ms << " ms"
+              << " | err " << std::setprecision(6) << res.max_abs_err
+              << " | rss " << std::setprecision(1) << res.peak_rss_mb << " MB\n";
+    return {d, {res.mean_ms, res.std_ms}, {res.max_abs_err, res.mse}, res.peak_rss_mb};
 }
-#endif
 
 // ---------------- main ----------------
 int main() {
-    // Print OMP_NUM_THREADS
     const char* omp_threads = std::getenv("OMP_NUM_THREADS");
     std::cout << "OMP_NUM_THREADS = " << (omp_threads ? omp_threads : "not set (using default)") << "\n\n";
 
-    HardReset();
     std::vector<int> dims(std::begin(kDims), std::end(kDims));
     auto presets = MakePresets();
 
@@ -372,19 +310,25 @@ int main() {
     // CSV header
     csv << "preset,N,depth_L,scalingBits,firstModBits,dnum,d";
 #ifdef RUN_BASELINE
-    csv << ",base_mean_ms,base_std_ms,base_max_abs_err,base_mse";
-#endif
-#ifdef RUN_LAZY
-    csv << ",lazy_mean_ms,lazy_std_ms,lazy_max_abs_err,lazy_mse";
+    csv << ",base_mean_ms,base_std_ms,base_max_abs_err,base_mse,base_peak_rss_mb";
 #endif
 #ifdef RUN_HOIST
-    csv << ",hoist_mean_ms,hoist_std_ms,hoist_max_abs_err,hoist_mse";
+    csv << ",hoist_mean_ms,hoist_std_ms,hoist_max_abs_err,hoist_mse,hoist_peak_rss_mb";
+#endif
+#ifdef RUN_DOUBLE_HOIST
+    csv << ",dhoist_mean_ms,dhoist_std_ms,dhoist_max_abs_err,dhoist_mse,dhoist_peak_rss_mb";
+#endif
+#ifdef RUN_LAZY
+    csv << ",lazy_mean_ms,lazy_std_ms,lazy_max_abs_err,lazy_mse,lazy_peak_rss_mb";
 #endif
 #if defined(RUN_BASELINE) && defined(RUN_LAZY)
     csv << ",speedup_lazy_x";
 #endif
 #if defined(RUN_BASELINE) && defined(RUN_HOIST)
     csv << ",speedup_hoist_x";
+#endif
+#if defined(RUN_BASELINE) && defined(RUN_DOUBLE_HOIST)
+    csv << ",speedup_dhoist_x";
 #endif
     csv << "\n";
 
@@ -395,69 +339,82 @@ int main() {
                   << " | first=" << ps.firstModBits
                   << " | dnum=3 ===\n";
 
-#ifdef RUN_LAZY
-        auto lazyRows  = run_lazy_suite(ps, dims, kTrials, kSeed);
-        HardReset();
-#endif
-#ifdef RUN_BASELINE
-        auto baseRows  = run_baseline_suite(ps, dims, kTrials, kSeed);
-        HardReset();
-#endif
-#ifdef RUN_HOIST
-        auto hoistRows = run_hoist_suite(ps, dims, kTrials, kSeed);
-        HardReset();
-#endif
-
-        std::cout << "  ==== Summary ====\n";
         for (size_t i = 0; i < dims.size(); ++i) {
             const int d = dims[i];
+
+#ifdef RUN_BASELINE
+            auto base = run_method_for_dim(ps, d, kTrials, kSeed, Method::Baseline);
+#endif
+#ifdef RUN_HOIST
+            auto hoist = run_method_for_dim(ps, d, kTrials, kSeed, Method::Hoist);
+#endif
+#ifdef RUN_DOUBLE_HOIST
+            auto dhoist = run_method_for_dim(ps, d, kTrials, kSeed, Method::DoubleHoist);
+#endif
+#ifdef RUN_LAZY
+            auto lazy = run_method_for_dim(ps, d, kTrials, kSeed, Method::Lazy);
+#endif
+
+            // CSV row
             csv << ps.name << "," << ps.ringDim << ","
                 << ps.multDepth << "," << ps.scalingBits << "," << ps.firstModBits << ","
                 << 3 << "," << d;
 
 #ifdef RUN_BASELINE
-            const auto& b = baseRows[i];
-            csv << "," << b.st.mean_ms << "," << b.st.std_ms
-                << "," << b.ac.max_abs_err << "," << b.ac.mse;
-#endif
-#ifdef RUN_LAZY
-            const auto& l = lazyRows[i];
-            csv << "," << l.st.mean_ms << "," << l.st.std_ms
-                << "," << l.ac.max_abs_err << "," << l.ac.mse;
+            csv << "," << base.st.mean_ms << "," << base.st.std_ms
+                << "," << base.ac.max_abs_err << "," << base.ac.mse
+                << "," << std::setprecision(1) << base.peak_rss_mb << std::setprecision(6);
 #endif
 #ifdef RUN_HOIST
-            const auto& h = hoistRows[i];
-            csv << "," << h.st.mean_ms << "," << h.st.std_ms
-                << "," << h.ac.max_abs_err << "," << h.ac.mse;
+            csv << "," << hoist.st.mean_ms << "," << hoist.st.std_ms
+                << "," << hoist.ac.max_abs_err << "," << hoist.ac.mse
+                << "," << std::setprecision(1) << hoist.peak_rss_mb << std::setprecision(6);
+#endif
+#ifdef RUN_DOUBLE_HOIST
+            csv << "," << dhoist.st.mean_ms << "," << dhoist.st.std_ms
+                << "," << dhoist.ac.max_abs_err << "," << dhoist.ac.mse
+                << "," << std::setprecision(1) << dhoist.peak_rss_mb << std::setprecision(6);
+#endif
+#ifdef RUN_LAZY
+            csv << "," << lazy.st.mean_ms << "," << lazy.st.std_ms
+                << "," << lazy.ac.max_abs_err << "," << lazy.ac.mse
+                << "," << std::setprecision(1) << lazy.peak_rss_mb << std::setprecision(6);
 #endif
 
-            // Console summary + optional speedups
-            std::cout << "  d=" << d;
+            // Console summary
+            std::cout << "  --- d=" << d << " summary ---\n";
 #ifdef RUN_BASELINE
-            std::cout << " | base "  << std::setprecision(3) << b.st.mean_ms << " ms";
-#endif
-#ifdef RUN_LAZY
-            std::cout << " | lazy "  << l.st.mean_ms << " ms";
+            std::cout << "    Baseline    : " << std::setprecision(3) << base.st.mean_ms
+                      << " ms | rss " << std::setprecision(1) << base.peak_rss_mb << " MB\n";
 #endif
 #ifdef RUN_HOIST
-            std::cout << " | hoist " << h.st.mean_ms << " ms";
+            std::cout << "    Hoist       : " << std::setprecision(3) << hoist.st.mean_ms
+                      << " ms | rss " << std::setprecision(1) << hoist.peak_rss_mb << " MB\n";
+#endif
+#ifdef RUN_DOUBLE_HOIST
+            std::cout << "    DoubleHoist : " << std::setprecision(3) << dhoist.st.mean_ms
+                      << " ms | rss " << std::setprecision(1) << dhoist.peak_rss_mb << " MB\n";
+#endif
+#ifdef RUN_LAZY
+            std::cout << "    Lazy        : " << std::setprecision(3) << lazy.st.mean_ms
+                      << " ms | rss " << std::setprecision(1) << lazy.peak_rss_mb << " MB\n";
 #endif
 
 #if defined(RUN_BASELINE) && defined(RUN_LAZY)
-            {
-                double speedup_lazy = b.st.mean_ms / std::max(1e-12, l.st.mean_ms);
-                csv << "," << std::setprecision(3) << speedup_lazy << std::setprecision(6);
-                std::cout << " | speedup(lazy) " << speedup_lazy << "x";
-            }
+            double speedup_lazy = base.st.mean_ms / std::max(1e-12, lazy.st.mean_ms);
+            csv << "," << std::setprecision(3) << speedup_lazy << std::setprecision(6);
+            std::cout << "    speedup(lazy)   = " << std::setprecision(3) << speedup_lazy << "x\n";
 #endif
 #if defined(RUN_BASELINE) && defined(RUN_HOIST)
-            {
-                double speedup_hoist = b.st.mean_ms / std::max(1e-12, h.st.mean_ms);
-                csv << "," << std::setprecision(3) << speedup_hoist << std::setprecision(6);
-                std::cout << " | speedup(hoist) " << speedup_hoist << "x";
-            }
+            double speedup_hoist = base.st.mean_ms / std::max(1e-12, hoist.st.mean_ms);
+            csv << "," << std::setprecision(3) << speedup_hoist << std::setprecision(6);
+            std::cout << "    speedup(hoist)  = " << std::setprecision(3) << speedup_hoist << "x\n";
 #endif
-            std::cout << "\n";
+#if defined(RUN_BASELINE) && defined(RUN_DOUBLE_HOIST)
+            double speedup_dhoist = base.st.mean_ms / std::max(1e-12, dhoist.st.mean_ms);
+            csv << "," << std::setprecision(3) << speedup_dhoist << std::setprecision(6);
+            std::cout << "    speedup(dhoist) = " << std::setprecision(3) << speedup_dhoist << "x\n";
+#endif
             csv << "\n";
         }
         csv.flush();

@@ -28,18 +28,17 @@
 #include <cmath>
 #include <cstdlib>
 #include <iterator>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <omp.h>
 
+#include "memory_tracker.h"
 #include "polycircuit/component/CIFAR10ImageClassification/CIFAR10ImageClassification.hpp"
 
 #include <openfhe/pke/constants-defs.h>
 #include <openfhe/pke/cryptocontext.h>
 #include <openfhe/pke/openfhe.h>
 #include <openfhe/pke/scheme/ckksrns/gen-cryptocontext-ckksrns-params.h>
-
-#include <boost/program_options.hpp>
-
-namespace po = boost::program_options;
 
 struct ParamSet {
     std::string name;
@@ -49,159 +48,305 @@ struct ParamSet {
     uint32_t firstModBits;
 };
 
-std::vector<ParamSet> get_param_sets() {
+static std::vector<ParamSet> get_param_sets() {
     return {
-        // {"N=2^13", 1u << 13, 5, 20, 30},
         {"N=2^14", 1u << 14, 7, 34, 46},
         {"N=2^15", 1u << 15, 13, 40, 51},
         {"N=2^16", 1u << 16, 24, 45, 56}
     };
 }
 
-struct BenchmarkResult {
-    std::string param_name;
-    int threads;
-    std::string method;
-    std::string image_name;
-    int ground_truth;
-    int predicted;
-    bool correct;
-    double inference_time_ms;
-};
+// -------- Timing/accuracy utils --------
+struct Stats { double mean_ms{0.0}; double std_ms{0.0}; };
+static Stats meanStd(const std::vector<double>& v) {
+    if (v.empty()) return {};
+    double m = std::accumulate(v.begin(), v.end(), 0.0) / (double)v.size();
+    double var = 0.0; for (double x : v) var += (x - m)*(x - m);
+    var /= (double)v.size();
+    return {m, std::sqrt(var)};
+}
 
-struct ExperimentStats {
-    std::string param_name;
-    int threads;
-    std::string method;
-    int total_tests;
+enum class Method { Baseline, Lazy };
+
+struct ChildResult {
+    double mean_ms;
+    double std_ms;
     int correct_count;
-    double accuracy;
-    double total_time_ms;
-    double avg_time_ms;
-    double min_time_ms;
-    double max_time_ms;
-    double std_dev_ms;
+    int total_tests;
+    double max_abs_err;
+    double mse;
+    double peak_rss_mb;
 };
-
-ExperimentStats calculate_stats(const std::vector<BenchmarkResult>& results) {
-    ExperimentStats stats{};
-    if (results.empty()) {
-        return stats;
-    }
-
-    stats.param_name = results[0].param_name;
-    stats.threads = results[0].threads;
-    stats.method = results[0].method;
-    stats.total_tests = static_cast<int>(results.size());
-    stats.correct_count = static_cast<int>(std::count_if(results.begin(), results.end(),
-                                                        [](const auto& r) { return r.correct; }));
-    stats.accuracy = 100.0 * static_cast<double>(stats.correct_count) / static_cast<double>(stats.total_tests);
-
-    std::vector<double> times;
-    times.reserve(results.size());
-    for (const auto& r : results) {
-        times.push_back(r.inference_time_ms);
-    }
-
-    stats.total_time_ms = std::accumulate(times.begin(), times.end(), 0.0);
-    stats.avg_time_ms = stats.total_time_ms / static_cast<double>(times.size());
-    stats.min_time_ms = *std::min_element(times.begin(), times.end());
-    stats.max_time_ms = *std::max_element(times.begin(), times.end());
-
-    double variance = 0.0;
-    for (double t : times) {
-        double d = t - stats.avg_time_ms;
-        variance += d * d;
-    }
-    stats.std_dev_ms = std::sqrt(variance / static_cast<double>(times.size()));
-
-    return stats;
-}
-
-void save_results_to_csv(const std::string& filename,
-                         const std::vector<ExperimentStats>& all_stats) {
-    std::ofstream ofs(filename);
-    if (!ofs.is_open()) {
-        throw std::runtime_error("Unable to create output file: " + filename);
-    }
-
-    ofs << "param_set,threads,method,total_tests,correct,accuracy,"
-        << "total_time_ms,avg_time_ms,min_time_ms,max_time_ms,std_dev_ms\n";
-
-    for (const auto& stats : all_stats) {
-        ofs << stats.param_name << ","
-            << stats.threads << ","
-            << stats.method << ","
-            << stats.total_tests << ","
-            << stats.correct_count << ","
-            << std::fixed << std::setprecision(2) << stats.accuracy << ","
-            << std::setprecision(3) << stats.total_time_ms << ","
-            << stats.avg_time_ms << ","
-            << stats.min_time_ms << ","
-            << stats.max_time_ms << ","
-            << stats.std_dev_ms << "\n";
-    }
-
-    ofs.close();
-    std::cout << "\nResults saved to: " << filename << std::endl;
-}
 
 static void configure_openmp(int num_threads) {
     setenv("OMP_PROC_BIND", "true", 1);
     setenv("OMP_PLACES", "cores", 1);
     setenv("OMP_DYNAMIC", "false", 1);
     setenv("OMP_NUM_THREADS", std::to_string(num_threads).c_str(), 1);
-
     omp_set_dynamic(0);
     omp_set_num_threads(num_threads);
+}
 
-    int actual = 0;
-#pragma omp parallel
-    {
-#pragma omp single
-        { actual = omp_get_num_threads(); }
+static ChildResult run_in_subprocess(
+    const ParamSet& ps,
+    const std::vector<std::pair<std::string, int>>& test_images,
+    int repetitions, int num_threads,
+    Method method,
+    const std::vector<std::vector<double>>& baseline_logits)
+{
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { perror("pipe"); exit(1); }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); exit(1); }
+
+    if (pid == 0) {
+        // ---- Child process ----
+        close(pipefd[0]);
+        configure_openmp(num_threads);
+
+        lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> params;
+        params.SetSecurityLevel(lbcrypto::HEStd_128_classic);
+        params.SetNumLargeDigits(3);
+        params.SetMultiplicativeDepth(ps.multDepth);
+        params.SetScalingModSize(ps.scalingBits);
+        params.SetFirstModSize(ps.firstModBits);
+        params.SetScalingTechnique(lbcrypto::ScalingTechnique::FLEXIBLEAUTO);
+        params.SetKeySwitchTechnique(
+            method == Method::Lazy ? lbcrypto::BATCHED : lbcrypto::HYBRID);
+        params.SetBatchSize(4096);
+        params.SetRingDim(ps.ringDim);
+
+        auto cc = lbcrypto::GenCryptoContext(params);
+        cc->Enable(lbcrypto::PKESchemeFeature::PKE);
+        cc->Enable(lbcrypto::PKESchemeFeature::KEYSWITCH);
+        cc->Enable(lbcrypto::PKESchemeFeature::LEVELEDSHE);
+        cc->Enable(lbcrypto::PKESchemeFeature::ADVANCEDSHE);
+        cc->Enable(lbcrypto::PKESchemeFeature::FHE);
+
+        auto keys = cc->KeyGen();
+        cc->EvalMultKeyGen(keys.secretKey);
+
+        std::vector<int> rot_indices = {-3, -2, -1, 10, 20, 40, 50, 100, 200, 400, 800, 1600};
+        if (method == Method::Lazy)
+            cc->EvalLazyRotateKeyGen(keys.secretKey, rot_indices);
+        else
+            cc->EvalRotateKeyGen(keys.secretKey, rot_indices);
+
+        // Warm-up
+        {
+            std::ifstream ifs(test_images[0].first);
+            std::vector<double> img{std::istream_iterator<double>{ifs},
+                                    std::istream_iterator<double>{}};
+            auto ptxt = cc->MakeCKKSPackedPlaintext(img);
+            auto c = cc->Encrypt(ptxt, keys.publicKey);
+            if (method == Method::Lazy) {
+                auto r = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
+                    polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(cc, std::move(c)).evaluate_lazy());
+                lbcrypto::Plaintext rptx;
+                cc->Decrypt(r, keys.secretKey, &rptx);
+            } else {
+                auto r = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
+                    polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(cc, std::move(c)).evaluate());
+                lbcrypto::Plaintext rptx;
+                cc->Decrypt(r, keys.secretKey, &rptx);
+            }
+        }
+
+        std::vector<double> times_ms;
+        int correct_count = 0;
+        int total_tests = 0;
+        double max_abs_err_overall = 0.0;
+        long double mse_sum = 0.0L;
+        int logit_idx = 0;
+
+        for (const auto& [filename, ground_truth] : test_images) {
+            std::ifstream ifs(filename);
+            if (!ifs.is_open()) {
+                std::cerr << "Unable to read: " << filename << "\n";
+                _exit(1);
+            }
+            std::vector<double> image_data{std::istream_iterator<double>{ifs},
+                                           std::istream_iterator<double>{}};
+
+            for (int rep = 0; rep < repetitions; rep++) {
+                auto ptxt = cc->MakeCKKSPackedPlaintext(image_data);
+                auto c = cc->Encrypt(ptxt, keys.publicKey);
+
+                auto t0 = std::chrono::steady_clock::now();
+                lbcrypto::Ciphertext<lbcrypto::DCRTPoly> result;
+                if (method == Method::Lazy) {
+                    result = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
+                        polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(
+                            cc, std::move(c)).evaluate_lazy());
+                } else {
+                    result = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
+                        polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(
+                            cc, std::move(c)).evaluate());
+                }
+                auto t1 = std::chrono::steady_clock::now();
+
+                lbcrypto::Plaintext rptx;
+                cc->Decrypt(result, keys.secretKey, &rptx);
+                rptx->SetLength(10);
+                auto classes = rptx->GetRealPackedValue();
+
+                int predicted = static_cast<int>(std::distance(
+                    classes.begin(), std::max_element(classes.begin(), classes.end())));
+                if (predicted == ground_truth) correct_count++;
+                total_tests++;
+
+                // Logits comparison with baseline (only if baseline logits available)
+                if (!baseline_logits.empty() && logit_idx < (int)baseline_logits.size()) {
+                    const auto& ref = baseline_logits[logit_idx];
+                    for (int k = 0; k < 10; k++) {
+                        double e = std::abs(classes[k] - ref[k]);
+                        if (e > max_abs_err_overall) max_abs_err_overall = e;
+                        mse_sum += (long double)e * (long double)e;
+                    }
+                }
+                logit_idx++;
+
+                times_ms.push_back(
+                    std::chrono::duration<double, std::milli>(t1 - t0).count());
+            }
+        }
+
+        Stats st = meanStd(times_ms);
+        ChildResult res;
+        res.mean_ms = st.mean_ms;
+        res.std_ms = st.std_ms;
+        res.correct_count = correct_count;
+        res.total_tests = total_tests;
+        res.max_abs_err = max_abs_err_overall;
+        res.mse = total_tests > 0
+            ? (double)(mse_sum / (long double)(total_tests * 10))
+            : 0.0;
+        res.peak_rss_mb = getPeakRSSMB();
+
+        write(pipefd[1], &res, sizeof(res));
+        close(pipefd[1]);
+        _exit(0);
     }
 
-    std::cout << "OpenMP requested=" << num_threads
-              << ", omp_get_max_threads()=" << omp_get_max_threads()
-              << ", actual_in_parallel=" << actual
-              << std::endl;
+    // ---- Parent process ----
+    close(pipefd[1]);
+
+    ChildResult res{};
+    ssize_t n = read(pipefd[0], &res, sizeof(res));
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    if (n != sizeof(res) || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        std::cerr << "  ERROR: child process failed\n";
+        return {};
+    }
+
+    return res;
+}
+
+// Collect baseline logits for cross-method comparison
+static std::vector<std::vector<double>> collect_baseline_logits(
+    const ParamSet& ps,
+    const std::vector<std::pair<std::string, int>>& test_images,
+    int repetitions, int num_threads)
+{
+    int pipefd[2];
+    if (pipe(pipefd) != 0) { perror("pipe"); exit(1); }
+
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); exit(1); }
+
+    int total = static_cast<int>(test_images.size()) * repetitions;
+
+    if (pid == 0) {
+        close(pipefd[0]);
+        configure_openmp(num_threads);
+
+        lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> params;
+        params.SetSecurityLevel(lbcrypto::HEStd_128_classic);
+        params.SetNumLargeDigits(3);
+        params.SetMultiplicativeDepth(ps.multDepth);
+        params.SetScalingModSize(ps.scalingBits);
+        params.SetFirstModSize(ps.firstModBits);
+        params.SetScalingTechnique(lbcrypto::ScalingTechnique::FLEXIBLEAUTO);
+        params.SetKeySwitchTechnique(lbcrypto::HYBRID);
+        params.SetBatchSize(4096);
+        params.SetRingDim(ps.ringDim);
+
+        auto cc = lbcrypto::GenCryptoContext(params);
+        cc->Enable(lbcrypto::PKESchemeFeature::PKE);
+        cc->Enable(lbcrypto::PKESchemeFeature::KEYSWITCH);
+        cc->Enable(lbcrypto::PKESchemeFeature::LEVELEDSHE);
+        cc->Enable(lbcrypto::PKESchemeFeature::ADVANCEDSHE);
+        cc->Enable(lbcrypto::PKESchemeFeature::FHE);
+
+        auto keys = cc->KeyGen();
+        cc->EvalMultKeyGen(keys.secretKey);
+        cc->EvalRotateKeyGen(keys.secretKey,
+            {-3, -2, -1, 10, 20, 40, 50, 100, 200, 400, 800, 1600});
+
+        // Write all logits as flat doubles: total * 10
+        for (const auto& [filename, gt] : test_images) {
+            std::ifstream ifs(filename);
+            std::vector<double> img{std::istream_iterator<double>{ifs},
+                                    std::istream_iterator<double>{}};
+            for (int rep = 0; rep < repetitions; rep++) {
+                auto ptxt = cc->MakeCKKSPackedPlaintext(img);
+                auto c = cc->Encrypt(ptxt, keys.publicKey);
+                auto result = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
+                    polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(
+                        cc, std::move(c)).evaluate());
+                lbcrypto::Plaintext rptx;
+                cc->Decrypt(result, keys.secretKey, &rptx);
+                rptx->SetLength(10);
+                auto classes = rptx->GetRealPackedValue();
+                double logits[10];
+                for (int k = 0; k < 10; k++) logits[k] = classes[k];
+                write(pipefd[1], logits, sizeof(logits));
+            }
+        }
+        close(pipefd[1]);
+        _exit(0);
+    }
+
+    close(pipefd[1]);
+
+    std::vector<std::vector<double>> all_logits;
+    all_logits.reserve(total);
+    for (int i = 0; i < total; i++) {
+        double logits[10];
+        ssize_t n = read(pipefd[0], logits, sizeof(logits));
+        if (n != sizeof(logits)) break;
+        all_logits.push_back(std::vector<double>(logits, logits + 10));
+    }
+    close(pipefd[0]);
+
+    int status;
+    waitpid(pid, &status, 0);
+
+    return all_logits;
 }
 
 int main(int argc, char* argv[]) try {
-    po::options_description desc("Allowed parameters");
-    desc.add_options()
-        ("help,h", "produce help message")
-        ("repetitions,r", po::value<int>()->default_value(25), "number of repetitions per image (default: 5)")
-        ("threads,t", po::value<std::string>()->default_value("1,32"), "comma-separated thread counts (default: 1,32)");
+    int REPETITIONS = 25;
+    int num_threads = 1;
 
-    po::variables_map vm;
-    po::store(po::parse_command_line(argc, argv, desc), vm);
-    po::notify(vm);
-
-    if (vm.count("help")) {
-        std::cout << desc << '\n';
-        return EXIT_SUCCESS;
-    }
-
-    const int REPETITIONS = vm["repetitions"].as<int>();
-    const std::string data_dir = "/home/user/shkim/lazy-batched-ksw/app/cifar10-infer/data/";
-    const std::string output_file = "/home/user/shkim/lazy-batched-ksw/app/cifar10-infer/cifar10_benchmark_results.csv";
-
-    std::vector<int> thread_counts;
-    {
-        std::string threads_str = vm["threads"].as<std::string>();
-        std::stringstream ss(threads_str);
-        std::string item;
-        while (std::getline(ss, item, ',')) {
-            if (!item.empty()) {
-                thread_counts.push_back(std::stoi(item));
-            }
-        }
-        if (thread_counts.empty()) {
-            throw std::runtime_error("No valid thread counts were provided.");
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if ((arg == "-r" || arg == "--repetitions") && i + 1 < argc)
+            REPETITIONS = std::stoi(argv[++i]);
+        else if ((arg == "-t" || arg == "--threads") && i + 1 < argc)
+            num_threads = std::stoi(argv[++i]);
+        else if (arg == "-h" || arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [-r repetitions] [-t threads]\n";
+            return EXIT_SUCCESS;
         }
     }
+    const std::string data_dir = "data/";
+    const std::string output_file = "cifar10_bench_results.csv";
 
     const std::vector<std::pair<std::string, int>> test_images = {
         {data_dir + "class-1.txt", 1},
@@ -212,219 +357,79 @@ int main(int argc, char* argv[]) try {
 
     auto param_sets = get_param_sets();
 
-    std::cout << "============================================" << std::endl;
-    std::cout << "CIFAR-10 Inference Benchmark" << std::endl;
-    std::cout << "============================================" << std::endl;
-    std::cout << "Images: " << test_images.size() << std::endl;
-    std::cout << "Repetitions per image: " << REPETITIONS << std::endl;
-    std::cout << "Total tests per experiment: " << (test_images.size() * REPETITIONS) << std::endl;
-    std::cout << "Parameter sets: " << param_sets.size() << std::endl;
-    std::cout << "Thread counts: ";
-    for (size_t i = 0; i < thread_counts.size(); ++i) {
-        std::cout << thread_counts[i];
-        if (i < thread_counts.size() - 1) std::cout << ", ";
-    }
-    std::cout << std::endl;
-    std::cout << "============================================\n" << std::endl;
+    std::cout << "============================================\n"
+              << "CIFAR-10 Inference Benchmark\n"
+              << "============================================\n"
+              << "Images: " << test_images.size() << "\n"
+              << "Repetitions per image: " << REPETITIONS << "\n"
+              << "Threads: " << num_threads << "\n"
+              << "Parameter sets: " << param_sets.size() << "\n"
+              << "============================================\n\n";
 
-    lbcrypto::SecurityLevel securityLevel = lbcrypto::HEStd_128_classic;
-    std::vector<ExperimentStats> all_stats;
+    std::ofstream csv(output_file);
+    csv << std::fixed << std::setprecision(6);
+    csv << "preset,N,depth_L,scalingBits,firstModBits,dnum"
+        << ",base_mean_ms,base_std_ms,base_accuracy,base_peak_rss_mb"
+        << ",lazy_mean_ms,lazy_std_ms,lazy_accuracy,lazy_max_abs_err,lazy_mse,lazy_peak_rss_mb"
+        << ",speedup_lazy_x\n";
 
     for (const auto& ps : param_sets) {
-        std::cout << "\n========================================" << std::endl;
-        std::cout << "Parameter Set: " << ps.name << std::endl;
-        std::cout << "  RingDim: " << ps.ringDim << std::endl;
-        std::cout << "  MultDepth: " << ps.multDepth << std::endl;
-        std::cout << "  ScalingBits: " << ps.scalingBits << std::endl;
-        std::cout << "  FirstModBits: " << ps.firstModBits << std::endl;
-        std::cout << "========================================" << std::endl;
+        std::cout << "\n=== " << ps.name << " | RingDim=" << ps.ringDim
+                  << " | L=" << ps.multDepth
+                  << " | scale=" << ps.scalingBits
+                  << " | first=" << ps.firstModBits
+                  << " | dnum=3 ===\n";
 
-        for (int num_threads : thread_counts) {
-            std::cout << "\n>>> Thread Count: " << num_threads << " <<<" << std::endl;
+        // Collect baseline logits for accuracy comparison
+        std::cout << "  Collecting baseline logits...\n";
+        auto baseline_logits = collect_baseline_logits(
+            ps, test_images, REPETITIONS, num_threads);
 
-            configure_openmp(num_threads);
+        // Baseline
+        std::cout << "  [Baseline] ... " << std::flush;
+        std::vector<std::vector<double>> empty_logits;
+        auto base = run_in_subprocess(ps, test_images, REPETITIONS, num_threads,
+                                       Method::Baseline, empty_logits);
+        double base_acc = 100.0 * base.correct_count / std::max(1, base.total_tests);
+        std::cout << std::fixed << std::setprecision(3) << base.mean_ms << " ms"
+                  << " | acc " << std::setprecision(1) << base_acc << "%"
+                  << " | rss " << base.peak_rss_mb << " MB\n";
 
-            std::cout << "\n  [Baseline - HYBRID]" << std::endl;
+        // Lazy
+        std::cout << "  [Lazy]     ... " << std::flush;
+        auto lazy = run_in_subprocess(ps, test_images, REPETITIONS, num_threads,
+                                       Method::Lazy, baseline_logits);
+        double lazy_acc = 100.0 * lazy.correct_count / std::max(1, lazy.total_tests);
+        std::cout << std::fixed << std::setprecision(3) << lazy.mean_ms << " ms"
+                  << " | acc " << std::setprecision(1) << lazy_acc << "%"
+                  << " | err " << std::setprecision(6) << lazy.max_abs_err
+                  << " | rss " << std::setprecision(1) << lazy.peak_rss_mb << " MB\n";
 
-            lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> params_baseline;
-            params_baseline.SetSecurityLevel(securityLevel);
-            params_baseline.SetNumLargeDigits(3);
-            params_baseline.SetMultiplicativeDepth(ps.multDepth);
-            params_baseline.SetScalingModSize(ps.scalingBits);
-            params_baseline.SetFirstModSize(ps.firstModBits);
-            params_baseline.SetScalingTechnique(lbcrypto::ScalingTechnique::FLEXIBLEAUTO);
-            params_baseline.SetKeySwitchTechnique(lbcrypto::HYBRID);
-            params_baseline.SetBatchSize(4096);
-            params_baseline.SetRingDim(ps.ringDim);
+        double speedup = base.mean_ms / std::max(1e-12, lazy.mean_ms);
+        std::cout << "  speedup(lazy) = " << std::setprecision(3) << speedup << "x\n";
 
-            auto cc_baseline = lbcrypto::GenCryptoContext(params_baseline);
-            cc_baseline->Enable(lbcrypto::PKESchemeFeature::PKE);
-            cc_baseline->Enable(lbcrypto::PKESchemeFeature::KEYSWITCH);
-            cc_baseline->Enable(lbcrypto::PKESchemeFeature::LEVELEDSHE);
-            cc_baseline->Enable(lbcrypto::PKESchemeFeature::ADVANCEDSHE);
-            cc_baseline->Enable(lbcrypto::PKESchemeFeature::FHE);
-
-            auto keys_baseline = cc_baseline->KeyGen();
-            cc_baseline->EvalMultKeyGen(keys_baseline.secretKey);
-            cc_baseline->EvalRotateKeyGen(keys_baseline.secretKey,
-                                          {-3, -2, -1, 10, 20, 40, 50, 100, 200, 400, 800, 1600});
-
-            std::vector<BenchmarkResult> baseline_results;
-            baseline_results.reserve(test_images.size() * static_cast<size_t>(REPETITIONS));
-
-            for (const auto& [filename, ground_truth] : test_images) {
-                std::ifstream ifs(filename);
-                if (!ifs.is_open()) {
-                    throw std::runtime_error("Unable to read: " + filename);
-                }
-                std::vector<double> image_data{std::istream_iterator<double>{ifs},
-                                               std::istream_iterator<double>{}};
-                ifs.close();
-
-                for (int rep = 0; rep < REPETITIONS; rep++) {
-                    lbcrypto::Plaintext ptxt = cc_baseline->MakeCKKSPackedPlaintext(image_data);
-                    auto c = cc_baseline->Encrypt(ptxt, keys_baseline.publicKey);
-
-                    auto start = std::chrono::high_resolution_clock::now();
-                    auto result = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
-                        polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(cc_baseline, std::move(c)).evaluate()
-                    );
-                    auto end = std::chrono::high_resolution_clock::now();
-
-                    lbcrypto::Plaintext rptx;
-                    cc_baseline->Decrypt(result, keys_baseline.secretKey, &rptx);
-                    rptx->SetLength(10);
-                    auto classes = rptx->GetRealPackedValue();
-                    int predicted = static_cast<int>(std::distance(classes.begin(),
-                                                                   std::max_element(classes.begin(), classes.end())));
-
-                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-                    baseline_results.push_back({
-                        ps.name,
-                        num_threads,
-                        "Baseline",
-                        filename,
-                        ground_truth,
-                        predicted,
-                        predicted == ground_truth,
-                        time_ms
-                    });
-                }
-            }
-
-            auto baseline_stats = calculate_stats(baseline_results);
-            all_stats.push_back(baseline_stats);
-            std::cout << "  Baseline: " << std::fixed << std::setprecision(3)
-                      << baseline_stats.avg_time_ms << " ms avg, "
-                      << std::setprecision(2) << baseline_stats.accuracy << "% accuracy" << std::endl;
-
-            std::cout << "\n  [Lazy - BATCHED]" << std::endl;
-
-            lbcrypto::CCParams<lbcrypto::CryptoContextCKKSRNS> params_lazy;
-            params_lazy.SetSecurityLevel(securityLevel);
-            params_lazy.SetNumLargeDigits(3);
-            params_lazy.SetMultiplicativeDepth(ps.multDepth);
-            params_lazy.SetScalingModSize(ps.scalingBits);
-            params_lazy.SetFirstModSize(ps.firstModBits);
-            params_lazy.SetScalingTechnique(lbcrypto::ScalingTechnique::FLEXIBLEAUTO);
-            params_lazy.SetKeySwitchTechnique(lbcrypto::BATCHED);
-            params_lazy.SetBatchSize(4096);
-            params_lazy.SetRingDim(ps.ringDim);
-
-            auto cc_lazy = lbcrypto::GenCryptoContext(params_lazy);
-            cc_lazy->Enable(lbcrypto::PKESchemeFeature::PKE);
-            cc_lazy->Enable(lbcrypto::PKESchemeFeature::KEYSWITCH);
-            cc_lazy->Enable(lbcrypto::PKESchemeFeature::LEVELEDSHE);
-            cc_lazy->Enable(lbcrypto::PKESchemeFeature::ADVANCEDSHE);
-            cc_lazy->Enable(lbcrypto::PKESchemeFeature::FHE);
-
-            auto keys_lazy = cc_lazy->KeyGen();
-            cc_lazy->EvalMultKeyGen(keys_lazy.secretKey);
-            cc_lazy->EvalLazyRotateKeyGen(keys_lazy.secretKey,
-                                          {-3, -2, -1, 10, 20, 40, 50, 100, 200, 400, 800, 1600});
-
-            std::vector<BenchmarkResult> lazy_results;
-            lazy_results.reserve(test_images.size() * static_cast<size_t>(REPETITIONS));
-
-            for (const auto& [filename, ground_truth] : test_images) {
-                std::ifstream ifs(filename);
-                if (!ifs.is_open()) {
-                    throw std::runtime_error("Unable to read: " + filename);
-                }
-                std::vector<double> image_data{std::istream_iterator<double>{ifs},
-                                               std::istream_iterator<double>{}};
-                ifs.close();
-
-                for (int rep = 0; rep < REPETITIONS; rep++) {
-                    lbcrypto::Plaintext ptxt = cc_lazy->MakeCKKSPackedPlaintext(image_data);
-                    auto c = cc_lazy->Encrypt(ptxt, keys_lazy.publicKey);
-
-                    auto start = std::chrono::high_resolution_clock::now();
-                    auto result = std::get<lbcrypto::Ciphertext<lbcrypto::DCRTPoly>>(
-                        polycircuit::CIFAR10ImageClassification<lbcrypto::DCRTPoly>(cc_lazy, std::move(c)).evaluate_lazy()
-                    );
-                    auto end = std::chrono::high_resolution_clock::now();
-
-                    lbcrypto::Plaintext rptx;
-                    cc_lazy->Decrypt(result, keys_lazy.secretKey, &rptx);
-                    rptx->SetLength(10);
-                    auto classes = rptx->GetRealPackedValue();
-                    int predicted = static_cast<int>(std::distance(classes.begin(),
-                                                                   std::max_element(classes.begin(), classes.end())));
-
-                    double time_ms = std::chrono::duration<double, std::milli>(end - start).count();
-
-                    lazy_results.push_back({
-                        ps.name,
-                        num_threads,
-                        "Lazy",
-                        filename,
-                        ground_truth,
-                        predicted,
-                        predicted == ground_truth,
-                        time_ms
-                    });
-                }
-            }
-
-            auto lazy_stats = calculate_stats(lazy_results);
-            all_stats.push_back(lazy_stats);
-            std::cout << "  Lazy:     " << std::fixed << std::setprecision(3)
-                      << lazy_stats.avg_time_ms << " ms avg, "
-                      << std::setprecision(2) << lazy_stats.accuracy << "% accuracy" << std::endl;
-
-            double speedup = baseline_stats.avg_time_ms / std::max(1e-9, lazy_stats.avg_time_ms);
-            std::cout << "  Speedup:  " << std::setprecision(3) << speedup << "x" << std::endl;
-        }
+        // CSV row
+        csv << ps.name << "," << ps.ringDim << ","
+            << ps.multDepth << "," << ps.scalingBits << ","
+            << ps.firstModBits << "," << 3
+            << "," << std::setprecision(3) << base.mean_ms
+            << "," << base.std_ms
+            << "," << std::setprecision(1) << base_acc
+            << "," << base.peak_rss_mb
+            << "," << std::setprecision(3) << lazy.mean_ms
+            << "," << lazy.std_ms
+            << "," << std::setprecision(1) << lazy_acc
+            << "," << std::setprecision(6) << lazy.max_abs_err
+            << "," << lazy.mse
+            << "," << std::setprecision(1) << lazy.peak_rss_mb
+            << "," << std::setprecision(3) << speedup
+            << "\n";
+        csv.flush();
     }
+    csv.close();
 
-    save_results_to_csv(output_file, all_stats);
-
-    std::cout << "\n\n============================================" << std::endl;
-    std::cout << "SUMMARY TABLE" << std::endl;
-    std::cout << "============================================" << std::endl;
-    std::cout << std::left << std::setw(20) << "Param Set"
-              << std::setw(10) << "Threads"
-              << std::setw(12) << "Method"
-              << std::setw(15) << "Avg Time (ms)"
-              << std::setw(12) << "Accuracy (%)" << std::endl;
-    std::cout << std::string(69, '-') << std::endl;
-
-    for (const auto& stats : all_stats) {
-        std::cout << std::left << std::setw(20) << stats.param_name
-                  << std::setw(10) << stats.threads
-                  << std::setw(12) << stats.method
-                  << std::fixed << std::setprecision(3) << std::setw(15) << stats.avg_time_ms
-                  << std::setprecision(2) << std::setw(12) << stats.accuracy << std::endl;
-    }
-    std::cout << "============================================" << std::endl;
-
+    std::cout << "\nResults written to " << output_file << "\n";
     return EXIT_SUCCESS;
-}
-catch (const po::error& ex) {
-    std::cerr << ex.what() << std::endl;
-    return EXIT_FAILURE;
 }
 catch (const std::exception& ex) {
     std::cerr << ex.what() << std::endl;

@@ -1,6 +1,6 @@
 cmake_minimum_required (VERSION 3.5.1)
 
-project(demo CXX)
+project(cbc-conv CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
@@ -10,7 +10,7 @@ endif()
 option(BUILD_STATIC "Set to ON to include static versions of the library" OFF)
 
 find_package(OpenFHE CONFIG REQUIRED)
-find_package(OpenMP QUIET)  
+find_package(OpenMP QUIET)
 
 if (OpenFHE_FOUND)
     message(STATUS "FOUND PACKAGE OpenFHE")
@@ -32,6 +32,7 @@ include_directories(${OpenFHE_INCLUDE}/pke)
 include_directories(${OpenFHE_INCLUDE}/binfhe)
 
 link_directories(${OpenFHE_LIBDIR})
+link_directories(${OPENMP_LIBRARIES})
 
 if(BUILD_STATIC)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenFHE_EXE_LINKER_FLAGS} -static")
@@ -41,23 +42,13 @@ else()
     link_libraries(${OpenFHE_SHARED_LIBRARIES})
 endif()
 
-include_directories(${CMAKE_SOURCE_DIR}/../../../utils)
+include_directories(${CMAKE_SOURCE_DIR}/../../utils)
 
-add_executable(jkls18-test
-  jkls18-test.cpp
-  jkls18.cpp
-)
-
-add_executable(double-hoist-test
-  double-hoist-test.cpp
-)
-
-add_executable(hoisted-direct-test
-  hoisted-direct-test.cpp
+add_executable(cbc_conv_test
+  cbc_conv_test.cpp
+  cbc_conv.cpp
 )
 
 if(OpenMP_CXX_FOUND)
-  target_link_libraries(jkls18-test PRIVATE OpenMP::OpenMP_CXX)
-  target_link_libraries(double-hoist-test PRIVATE OpenMP::OpenMP_CXX)
-  target_link_libraries(hoisted-direct-test PRIVATE OpenMP::OpenMP_CXX)
+  target_link_libraries(cbc_conv_test PRIVATE OpenMP::OpenMP_CXX)
 endif()
